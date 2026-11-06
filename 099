@@ -270,14 +270,18 @@ class Notepad:
         self.text.mark_set("insert", end)
         self.text.see(pos)
 
-
 def main():
+    if sys.platform == "win32":
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
     root = tk.Tk()
     app = Notepad(root)
     if len(sys.argv) > 1:
         app.open_file(sys.argv[1])
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
