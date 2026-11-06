@@ -23,8 +23,8 @@ ENCODINGS = ("utf-8", "utf-8-sig", "utf-16", "cp1252", "latin-1")
 EOLS = {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}
 EOL_NAMES = {v: k for k, v in EOLS.items()}
 DEFAULT_EOL = "\r\n" if sys.platform == "win32" else "\n"
-FILETYPES = [("Text files", "*.txt *.md *.py *.csv *.json *.log *.ini *.xml *.html"),
-             ("All files", "*.*")]
+FILETYPES = [("All files", "*.*"),
+              ("Text files", "*.txt *.md *.py *.csv *.json *.log *.ini *.xml *.html")]
 
 MAX_RECENT = 10
 HIGHLIGHT_LIMIT = 500_000      # characters; bigger files are not highlighted
