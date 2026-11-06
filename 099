@@ -9,7 +9,6 @@ FILETYPES = [("Text files", "*.txt *.md *.py *.csv *.json *.log *.ini *.xml *.ht
 BG = "#001040"
 FG = "#FFFFFF"
 
-
 class Notepad:
     def __init__(self, root):
         self.root = root
