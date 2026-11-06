@@ -1,41 +1,671 @@
+import bisect
+import codecs
+import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
+import time
+import uuid
 import tkinter as tk
-from tkinter import filedialog, messagebox
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
-ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+# Standard library only: no pip install needed.
+
+APP = "Notepad"
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".pynotepad")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+RECOVERY_DIR = os.path.join(CONFIG_DIR, "recovery")
+
+ENCODINGS = ("utf-8", "utf-8-sig", "utf-16", "cp1252", "latin-1")
+EOLS = {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}
+EOL_NAMES = {v: k for k, v in EOLS.items()}
+DEFAULT_EOL = "\r\n" if sys.platform == "win32" else "\n"
 FILETYPES = [("Text files", "*.txt *.md *.py *.csv *.json *.log *.ini *.xml *.html"),
              ("All files", "*.*")]
+
+MAX_RECENT = 10
+HIGHLIGHT_LIMIT = 500_000      # characters; bigger files are not highlighted
+BRACKET_LIMIT = 50_000         # characters scanned when matching brackets
+RECOVERY_INTERVAL = 30_000     # ms between recovery snapshots
+DISK_CHECK_INTERVAL = 2_000    # ms between "changed on disk" checks
+MIN_SIZE, MAX_SIZE = 6, 48
+
+if sys.platform == "win32":
+    DEFAULT_FONT = "Consolas"
+elif sys.platform == "darwin":
+    DEFAULT_FONT = "Menlo"
+else:
+    DEFAULT_FONT = "DejaVu Sans Mono"
+DEFAULT_SIZE = 11
+
 BG = "#001040"
 FG = "#FFFFFF"
+
+THEMES = {
+    "Blue": {
+        "bg": BG, "fg": FG, "sel_bg": FG, "sel_fg": BG, "cursor": FG,
+        "gutter_bg": "#000A2A", "gutter_fg": "#6070A0",
+        "status_bg": "#C0C0C0", "status_fg": "#000000", "bracket": "#3050A0",
+        "comment": "#8C9CC0", "string": "#55FF55", "number": "#FF77FF",
+        "keyword": "#FFFF55", "builtin": "#55FFFF", "function": "#FFD080",
+        "klass": "#FFD080", "decorator": "#FF9955", "operator": "#FFFFFF",
+    },
+    "Dark": {
+        "bg": "#1E1E1E", "fg": "#D4D4D4", "sel_bg": "#264F78", "sel_fg": "#FFFFFF",
+        "cursor": "#AEAFAD", "gutter_bg": "#1E1E1E", "gutter_fg": "#858585",
+        "status_bg": "#007ACC", "status_fg": "#FFFFFF", "bracket": "#4A4D55",
+        "comment": "#6A9955", "string": "#CE9178", "number": "#B5CEA8",
+        "keyword": "#569CD6", "builtin": "#4EC9B0", "function": "#DCDCAA",
+        "klass": "#4EC9B0", "decorator": "#C586C0", "operator": "#D4D4D4",
+    },
+    "Light": {
+        "bg": "#FFFFFF", "fg": "#000000", "sel_bg": "#ADD6FF", "sel_fg": "#000000",
+        "cursor": "#000000", "gutter_bg": "#F3F3F3", "gutter_fg": "#999999",
+        "status_bg": "#E0E0E0", "status_fg": "#000000", "bracket": "#C8E1FF",
+        "comment": "#008000", "string": "#A31515", "number": "#098658",
+        "keyword": "#0000FF", "builtin": "#267F99", "function": "#795E26",
+        "klass": "#267F99", "decorator": "#AF00DB", "operator": "#000000",
+    },
+}
+
+TOKEN_GROUP_NAMES = ("comment", "string", "number", "keyword", "builtin",
+                     "function", "klass", "decorator", "operator")
+
+# ---------------- built-in syntax highlighter (regular expressions) ----------------
+
+
+def _words(names, ignore_case=False):
+    body = r"\b(?:" + "|".join(names.split()) + r")\b"
+    return f"(?i:{body})" if ignore_case else body
+
+
+def _language(*rules):
+    """Combine (group, regex) rules into one pattern; earlier rules win."""
+    return re.compile("|".join(f"(?P<{group}_{i}>{pattern})"
+                               for i, (group, pattern) in enumerate(rules)), re.MULTILINE)
+
+
+STR_DQ = r'"(?:\\.|[^"\\\n])*"?'
+STR_SQ = r"'(?:\\.|[^'\\\n])*'?"
+NUMBER = r"\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?)[jJlLfFuU]*\b"
+
+PY_KEYWORDS = ("False None True and as assert async await break class continue def del elif "
+               "else except finally for from global if import in is lambda nonlocal not or "
+               "pass raise return try while with yield")
+PY_BUILTINS = ("self cls print len range str int float bool bytes list dict set tuple frozenset "
+               "open type isinstance issubclass super enumerate zip map filter sorted reversed "
+               "min max sum abs round any all input repr hash id iter next getattr setattr "
+               "hasattr delattr callable vars dir format chr ord object property staticmethod "
+               "classmethod Exception ValueError TypeError KeyError IndexError AttributeError "
+               "RuntimeError OSError ImportError StopIteration NotImplementedError __name__")
+CLIKE_KEYWORDS = (
+    "abstract as async await auto break case catch char class const constexpr continue "
+    "default defer delete do double else elseif enum export extends extern false final finally "
+    "float fn for foreach from func function go goto if impl implements import in instanceof "
+    "int interface internal let long loop match mod module mut namespace new nil null nullptr "
+    "override package private protected pub public readonly ref return select short signed "
+    "sizeof static struct super switch synchronized template this throw throws trait true try "
+    "type typedef typeof undefined union unsafe unsigned use using var virtual void volatile "
+    "where while with yield bool boolean string byte echo require require_once")
+CLIKE_BUILTINS = ("console window document Math JSON Object Array String Number Promise Map Set "
+                  "Error System std printf malloc free Vec Option Some None Ok Err fmt len make "
+                  "append println print")
+SQL_KEYWORDS = (
+    "select from where and or not insert into values update set delete create alter drop "
+    "table view index primary key foreign references join inner left right outer full cross "
+    "on as group by order having limit offset distinct union all exists in is null like "
+    "between case when then else end begin commit rollback transaction declare procedure "
+    "function return returns if while database schema default unique check constraint asc "
+    "desc top with grant revoke int integer varchar char text date datetime timestamp "
+    "boolean float decimal numeric bigint")
+SHELL_KEYWORDS = ("if then else elif fi for do done while until case esac in function return "
+                  "export local readonly source exit break continue shift set unset echo cd test")
+BATCH_KEYWORDS = ("echo set if else goto call for in do exist not errorlevel defined equ neq lss "
+                  "leq gtr geq setlocal endlocal enabledelayedexpansion exit pause cls cd pushd "
+                  "popd mkdir rmdir del copy move start title shift off on nul")
+
+
+def _clike(preprocessor=False):
+    rules = [
+        ("comment", r"//[^\n]*|/\*[\s\S]*?(?:\*/|\Z)"),
+        ("string", STR_DQ + "|" + STR_SQ + r"|`(?:\\.|[^`\\])*`?"),
+    ]
+    if preprocessor:
+        rules.append(("decorator", r"^[ \t]*#[ \t]*\w+"))
+    rules += [
+        ("decorator", r"@[A-Za-z_]\w*"),
+        ("builtin", r"\$\w+"),
+        ("klass", r"(?<=class )\w+|(?<=struct )\w+|(?<=interface )\w+"),
+        ("keyword", _words(CLIKE_KEYWORDS)),
+        ("builtin", _words(CLIKE_BUILTINS)),
+        ("function", r"\b[A-Za-z_]\w*(?=\s*\()"),
+        ("number", NUMBER),
+    ]
+    return _language(*rules)
+
+
+LANGUAGES = {
+    "python": _language(
+        ("comment", r"#[^\n]*"),
+        ("string", r"(?:\b[rRbBuUfF]{1,2})?(?:'''[\s\S]*?(?:'''|\Z)|\"\"\"[\s\S]*?(?:\"\"\"|\Z)|"
+                   + STR_DQ + "|" + STR_SQ + ")"),
+        ("decorator", r"@[A-Za-z_][\w.]*"),
+        ("function", r"(?<=def )[A-Za-z_]\w*"),
+        ("klass", r"(?<=class )[A-Za-z_]\w*"),
+        ("keyword", _words(PY_KEYWORDS)),
+        ("builtin", _words(PY_BUILTINS)),
+        ("number", NUMBER),
+    ),
+    "clike": _clike(),
+    "c": _clike(preprocessor=True),
+    "json": _language(
+        ("builtin", r'"(?:\\.|[^"\\\n])*"(?=\s*:)'),
+        ("string", STR_DQ),
+        ("keyword", _words("true false null")),
+        ("number", r"-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b"),
+    ),
+    "markup": _language(
+        ("comment", r"<!--[\s\S]*?(?:-->|\Z)"),
+        ("string", r"<!\[CDATA\[[\s\S]*?(?:\]\]>|\Z)"),
+        ("decorator", r"<[!?][^>]*>?"),
+        ("keyword", r"</?[A-Za-z][\w:.-]*|/?>"),
+        ("builtin", r"\b[\w:-]+(?==)"),
+        ("string", r"(?<==)\"[^\"]*\"?|(?<==)'[^']*'?"),
+        ("number", r"&#?\w+;"),
+    ),
+    "css": _language(
+        ("comment", r"/\*[\s\S]*?(?:\*/|\Z)"),
+        ("string", STR_DQ + "|" + STR_SQ),
+        ("keyword", r"@[\w-]+|!important"),
+        ("number", r"#[0-9a-fA-F]{3,8}\b|-?\b\d+(?:\.\d+)?"
+                   r"(?:px|em|rem|vh|vw|vmin|vmax|ch|pt|deg|ms|s|fr|%)?"),
+        ("builtin", r"[\w-]+(?=\s*:[^\n{]*;)"),
+        ("function", r"\b[\w-]+(?=\()"),
+    ),
+    "ini": _language(
+        ("comment", r"^[ \t]*[;#][^\n]*"),
+        ("keyword", r"^[ \t]*\[[^\]\n]*\]"),
+        ("builtin", r"^[ \t]*[^\s=:;#\[][^=:\n]*?(?=[ \t]*[=:])"),
+        ("string", STR_DQ),
+        ("keyword", _words("true false yes no on off", ignore_case=True)),
+        ("number", r"\b\d+(?:\.\d+)?\b"),
+    ),
+    "sql": _language(
+        ("comment", r"--[^\n]*|/\*[\s\S]*?(?:\*/|\Z)"),
+        ("string", r"'(?:''|[^'])*'?"),
+        ("builtin", r'"[^"\n]*"|`[^`\n]*`|\[[^\]\n]*\]'),
+        ("keyword", _words(SQL_KEYWORDS, ignore_case=True)),
+        ("function", r"\b\w+(?=\s*\()"),
+        ("number", NUMBER),
+    ),
+    "shell": _language(
+        ("comment", r"(?:^|(?<=[ \t]))#[^\n]*"),
+        ("string", r'"(?:\\.|[^"\\])*"?|' + r"'[^']*'?"),
+        ("builtin", r"\$\{[^}\n]*\}?|\$(?:\w+|[@#?$!*-])"),
+        ("keyword", _words(SHELL_KEYWORDS)),
+        ("function", r"^[ \t]*[A-Za-z_]\w*(?=\s*\(\))"),
+        ("number", r"\b\d+\b"),
+    ),
+    "batch": _language(
+        ("comment", r"^[ \t]*(?:(?i:rem)\b|::)[^\n]*"),
+        ("function", r"^[ \t]*:\w+"),
+        ("string", r'"[^"\n]*"?'),
+        ("builtin", r"%%?~?\w+%?|!\w+!"),
+        ("keyword", _words(BATCH_KEYWORDS, ignore_case=True)),
+        ("number", r"\b\d+\b"),
+    ),
+    "markdown": _language(
+        ("string", r"^```[\s\S]*?(?:^```[^\n]*|\Z)"),
+        ("keyword", r"^#{1,6}[ \t][^\n]*"),
+        ("comment", r"^>[^\n]*"),
+        ("string", r"`[^`\n]+`"),
+        ("function", r"\*\*[^*\n]+\*\*|__[^_\n]+__"),
+        ("builtin", r"!?\[[^\]\n]*\]\([^)\n]*\)"),
+        ("number", r"^[ \t]*(?:[-*+]|\d+\.)(?=[ \t])"),
+    ),
+}
+
+EXTENSIONS = {}
+for _lang, _exts in (
+        ("python", "py pyw"),
+        ("clike", "js mjs cjs jsx ts tsx java go rs php kt kts swift dart scala groovy"),
+        ("c", "c h cpp hpp cc cxx hh cs m"),
+        ("json", "json jsonc"),
+        ("markup", "html htm xhtml xml svg xaml xsl xslt csproj vbproj config plist"),
+        ("css", "css scss less"),
+        ("ini", "ini cfg conf toml properties env gitconfig editorconfig reg"),
+        ("sql", "sql"),
+        ("shell", "sh bash zsh ksh bashrc zshrc profile"),
+        ("batch", "bat cmd"),
+        ("markdown", "md markdown")):
+    for _ext in _exts.split():
+        EXTENSIONS[_ext] = _lang
+
+AUTO_INDENT_OPENERS = {"python": (":", "(", "[", "{")}
+for _lang in ("clike", "c", "json", "css", "shell"):
+    AUTO_INDENT_OPENERS[_lang] = ("{", "(", "[")
+
+
+def detect_language(path):
+    if not path:
+        return None
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    if not ext:  # files such as ".bashrc" or ".gitconfig"
+        ext = os.path.basename(path).lower().lstrip(".")
+    return EXTENSIONS.get(ext)
+
+
+DEFAULT_CONFIG = {
+    "font_family": DEFAULT_FONT, "font_size": DEFAULT_SIZE,
+    "wrap": False, "auto_indent": True, "line_numbers": True, "highlight": True,
+    "theme": "Blue", "geometry": "900x600", "maximized": False, "recent": [],
+    "match_case": False, "whole_word": False, "regex": False,
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            cfg.update(data)
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def decode_bytes(data, forced=None):
+    """Return (text, encoding). BOMs are detected first; latin-1 always succeeds."""
+    if forced:
+        return data.decode(forced, errors="replace"), forced
+    if data.startswith(codecs.BOM_UTF8):
+        return data[len(codecs.BOM_UTF8):].decode("utf-8", errors="replace"), "utf-8-sig"
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", errors="replace"), "utf-16"
+    for enc in ("utf-8", "cp1252"):
+        try:
+            return data.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1"), "latin-1"
+
+
+def detect_eol(text):
+    if "\r\n" in text:
+        return "\r\n"
+    if "\r" in text:
+        return "\r"
+    if "\n" in text:
+        return "\n"
+    return DEFAULT_EOL
+
+
+class ProxyText(tk.Text):
+    """Text widget that reports content and cursor changes."""
+
+    def __init__(self, master, **kw):
+        super().__init__(master, **kw)
+        self.on_change = None
+        self.on_cursor = None
+        self._orig = self._w + "_orig"
+        self.tk.call("rename", self._w, self._orig)
+        self.tk.createcommand(self._w, self._proxy)
+
+    def _proxy(self, *args):
+        try:
+            result = self.tk.call((self._orig,) + args)
+        except tk.TclError:
+            return ""
+        cmd = args[0] if args else ""
+        changed = cmd in ("insert", "delete", "replace") or (
+            cmd == "edit" and len(args) > 1 and args[1] in ("undo", "redo"))
+        moved = changed or (cmd == "mark" and len(args) > 2
+                            and args[1] == "set" and args[2] == "insert")
+        if changed and self.on_change:
+            self.on_change()
+        if moved and self.on_cursor:
+            self.on_cursor()
+        return result
+
+    def destroy(self):
+        super().destroy()
+        try:
+            self.tk.deletecommand(self._w)
+        except tk.TclError:
+            pass
+
+
+class Document:
+    """One tab: text area, line-number gutter and file metadata."""
+
+    def __init__(self, app, title):
+        self.app = app
+        self.id = uuid.uuid4().hex
+        self.title = title
+        self.path = None
+        self.encoding = "utf-8"
+        self.eol = DEFAULT_EOL
+        self.mtime = None
+        self.lang = None
+        self.words = 0
+        self.chars = 0
+        self._refresh_job = None
+        self._lines_job = None
+        self._cursor_job = None
+
+        self.frame = tk.Frame(app.nb, bd=0)
+        self.gutter = tk.Canvas(self.frame, width=40, bd=0, highlightthickness=0)
+        self.text = ProxyText(self.frame, wrap="word" if app.wrap.get() else "none",
+                              undo=True, maxundo=-1, font=app.font,
+                              borderwidth=0, highlightthickness=0, padx=8, pady=6)
+        self.sy = tk.Scrollbar(self.frame, orient="vertical", command=self.text.yview)
+        self.sx = tk.Scrollbar(self.frame, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=self._on_yscroll, xscrollcommand=self.sx.set)
+
+        self.gutter.grid(row=0, column=0, sticky="ns")
+        self.text.grid(row=0, column=1, sticky="nsew")
+        self.sy.grid(row=0, column=2, sticky="ns")
+        self.sx.grid(row=1, column=1, sticky="ew")
+        self.frame.rowconfigure(0, weight=1)
+        self.frame.columnconfigure(1, weight=1)
+        if not app.line_numbers.get():
+            self.gutter.grid_remove()
+
+        for name in TOKEN_GROUP_NAMES:
+            self.text.tag_configure("tok_" + name)
+        self.text.tag_configure("bracket")
+        self.text.tag_raise("bracket")
+        self.text.tag_raise("sel")
+        self.apply_theme()
+
+        self.text.on_change = self._on_change
+        self.text.on_cursor = self._on_cursor
+
+        t = self.text
+        t.bind("<<Modified>>", lambda e: app.update_tab(self))
+        t.bind("<Return>", self._on_return)
+        t.bind("<KP_Enter>", self._on_return)
+        t.bind("<Control-MouseWheel>", app.on_ctrl_wheel)
+        t.bind("<Control-Button-4>", app.on_ctrl_wheel)
+        t.bind("<Control-Button-5>", app.on_ctrl_wheel)
+        t.bind("<Button-2>" if app.aqua else "<Button-3>", app.show_context_menu)
+        self.gutter.bind("<MouseWheel>", self._gutter_wheel)
+        self.gutter.bind("<Button-4>", lambda e: self.text.yview_scroll(-3, "units"))
+        self.gutter.bind("<Button-5>", lambda e: self.text.yview_scroll(3, "units"))
+        app.bind_shortcuts(t)
+
+    # ---- info ----
+    def name(self):
+        return os.path.basename(self.path) if self.path else self.title
+
+    def modified(self):
+        return bool(self.text.edit_modified())
+
+    def content(self):
+        return self.text.get("1.0", "end-1c")
+
+    def is_blank(self):
+        return self.path is None and not self.modified() and not self.content()
+
+    # ---- content ----
+    def set_content(self, content):
+        t = self.text
+        t.delete("1.0", "end")
+        t.insert("1.0", content)
+        t.edit_reset()
+        t.edit_modified(False)
+        t.mark_set("insert", "1.0")
+        t.see("1.0")
+
+    def load(self, path, content, encoding, size):
+        self.eol = detect_eol(content)
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        self.path = path
+        self.encoding = encoding
+        try:
+            self.mtime = os.path.getmtime(path)
+        except OSError:
+            self.mtime = None
+        self.set_content(content)
+        self.setup_lexer()
+        self.app.update_tab(self)
+        lines = content.count("\n") + 1
+        self.app.set_message(f"{path}   |   {lines:,} lines   |   {size:,} bytes")
+
+    def setup_lexer(self):
+        self.lang = detect_language(self.path)
+        self.schedule_refresh(0)
+
+    # ---- appearance ----
+    def apply_theme(self):
+        th = self.app.theme
+        self.text.config(bg=th["bg"], fg=th["fg"], insertbackground=th["cursor"],
+                         selectbackground=th["sel_bg"], selectforeground=th["sel_fg"],
+                         inactiveselectbackground=th["sel_bg"])
+        self.frame.config(bg=th["bg"])
+        self.gutter.config(bg=th["gutter_bg"])
+        self.text.tag_configure("bracket", background=th["bracket"])
+        for name in TOKEN_GROUP_NAMES:
+            self.text.tag_configure("tok_" + name, foreground=th[name])
+        self.redraw_gutter()
+
+    def redraw_gutter(self):
+        if not self.app.line_numbers.get():
+            return
+        g, t = self.gutter, self.text
+        last = int(t.index("end-1c").split(".")[0])
+        width = self.app.font.measure("0" * max(3, len(str(last)))) + 14
+        if int(g.cget("width")) != width:
+            g.config(width=width)
+        g.delete("all")
+        fill = self.app.theme["gutter_fg"]
+        first = int(t.index("@0,0").split(".")[0])
+        drawn = False
+        for n in range(first, last + 1):
+            info = t.dlineinfo(f"{n}.0")
+            if info is None:
+                if drawn:
+                    break
+                continue
+            drawn = True
+            g.create_text(width - 6, info[1], anchor="ne", text=str(n),
+                          font=self.app.font, fill=fill)
+
+    def highlight(self):
+        t = self.text
+        for name in TOKEN_GROUP_NAMES:
+            t.tag_remove("tok_" + name, "1.0", "end")
+        if not (self.lang and self.app.highlight.get()):
+            return
+        content = self.content()
+        if len(content) > HIGHLIGHT_LIMIT:
+            return
+        starts = [0]
+        pos = content.find("\n")
+        while pos != -1:
+            starts.append(pos + 1)
+            pos = content.find("\n", pos + 1)
+
+        def index(offset):
+            line = bisect.bisect_right(starts, offset) - 1
+            return f"{line + 1}.{offset - starts[line]}"
+
+        ranges = {}
+        for m in LANGUAGES[self.lang].finditer(content):
+            if m.end() > m.start():
+                group = m.lastgroup.rsplit("_", 1)[0]
+                ranges.setdefault(group, []).extend((index(m.start()), index(m.end())))
+        for group, idx in ranges.items():
+            for i in range(0, len(idx), 2000):
+                t.tag_add("tok_" + group, *idx[i:i + 2000])
+
+    def match_brackets(self):
+        t = self.text
+        t.tag_remove("bracket", "1.0", "end")
+        opens = {"(": ")", "[": "]", "{": "}"}
+        closes = {v: k for k, v in opens.items()}
+        for idx in ("insert-1c", "insert"):
+            ch = t.get(idx)
+            if ch in opens or ch in closes:
+                break
+        else:
+            return
+        pos = t.index(idx)
+        other = None
+        depth = 0
+        if ch in opens:
+            close = opens[ch]
+            for i, c in enumerate(t.get(pos, f"{pos}+{BRACKET_LIMIT}c")):
+                if c == ch:
+                    depth += 1
+                elif c == close:
+                    depth -= 1
+                    if depth == 0:
+                        other = f"{pos}+{i}c"
+                        break
+        else:
+            open_ = closes[ch]
+            chunk = t.get(f"{pos}-{BRACKET_LIMIT}c", f"{pos}+1c")
+            for i, c in enumerate(reversed(chunk)):
+                if c == ch:
+                    depth += 1
+                elif c == open_:
+                    depth -= 1
+                    if depth == 0:
+                        other = f"{pos}-{i}c"
+                        break
+        if other:
+            t.tag_add("bracket", pos, f"{pos}+1c", other, f"{other}+1c")
+
+    # ---- change tracking ----
+    def _on_yscroll(self, first, last):
+        self.sy.set(first, last)
+        self.redraw_gutter()
+
+    def _on_change(self):
+        if self._lines_job is None:
+            self._lines_job = self.text.after_idle(self._lines_idle)
+        self.schedule_refresh(250)
+
+    def _lines_idle(self):
+        self._lines_job = None
+        self.redraw_gutter()
+
+    def _on_cursor(self):
+        if self._cursor_job is None:
+            self._cursor_job = self.text.after_idle(self._cursor_idle)
+
+    def _cursor_idle(self):
+        self._cursor_job = None
+        self.match_brackets()
+        if self.app.current() is self:
+            self.app.update_status()
+
+    def schedule_refresh(self, delay):
+        if self._refresh_job:
+            self.text.after_cancel(self._refresh_job)
+        self._refresh_job = self.text.after(delay, self.refresh)
+
+    def refresh(self):
+        self._refresh_job = None
+        self.highlight()
+        content = self.content()
+        self.chars = len(content)
+        self.words = len(content.split())
+        self.redraw_gutter()
+        if self.app.current() is self:
+            self.app.update_status()
+
+    # ---- editing helpers ----
+    def _on_return(self, event):
+        if not self.app.auto_indent.get():
+            return None
+        t = self.text
+        line = t.get("insert linestart", "insert")
+        indent = re.match(r"[ \t]*", line).group(0)
+        openers = AUTO_INDENT_OPENERS.get(self.lang)
+        if openers and line.rstrip().endswith(openers):
+            indent += "\t" if indent.startswith("\t") else "    "
+        if t.tag_ranges("sel"):
+            t.delete("sel.first", "sel.last")
+        t.insert("insert", "\n" + indent)
+        t.see("insert")
+        return "break"
+
+    def _gutter_wheel(self, event):
+        self.text.yview_scroll(-3 if event.delta > 0 else 3, "units")
+        return "break"
+
+    def destroy(self):
+        for job in (self._refresh_job, self._lines_job, self._cursor_job):
+            if job:
+                try:
+                    self.text.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self.text.on_change = self.text.on_cursor = None
+        self.frame.destroy()
+
 
 class Notepad:
     def __init__(self, root):
         self.root = root
-        self.root.geometry("900x600")
-        self.font_size = 11
-        self.wrap = tk.BooleanVar(value=False)
-        self.last_search = ""
-        self.path = None
-        self.encoding = "utf-8"
+        self.cfg = load_config()
+        self.docs = {}
+        self._untitled = 0
+        self._checking = False
+        self.find_win = None
+        self.aqua = root.tk.call("tk", "windowingsystem") == "aqua"
+
+        theme = self.cfg["theme"] if self.cfg["theme"] in THEMES else "Blue"
+        self.theme = THEMES[theme]
+        self.font_size = self._clamp(self.cfg["font_size"])
+        self.font = tkfont.Font(root, family=self.cfg["font_family"], size=self.font_size)
+
+        self.wrap = tk.BooleanVar(value=self.cfg["wrap"])
+        self.auto_indent = tk.BooleanVar(value=self.cfg["auto_indent"])
+        self.line_numbers = tk.BooleanVar(value=self.cfg["line_numbers"])
+        self.highlight = tk.BooleanVar(value=self.cfg["highlight"])
+        self.theme_var = tk.StringVar(value=theme)
+        self.enc_var = tk.StringVar(value="utf-8")
+        self.eol_var = tk.StringVar(value=EOL_NAMES[DEFAULT_EOL])
+        self.find_var = tk.StringVar()
+        self.replace_var = tk.StringVar()
+        self.opt_case = tk.BooleanVar(value=self.cfg["match_case"])
+        self.opt_word = tk.BooleanVar(value=self.cfg["whole_word"])
+        self.opt_regex = tk.BooleanVar(value=self.cfg["regex"])
+
+        try:
+            root.geometry(self.cfg["geometry"])
+        except tk.TclError:
+            root.geometry("900x600")
+        if self.cfg.get("maximized"):
+            try:
+                root.state("zoomed")
+            except tk.TclError:
+                pass
 
         self._set_icon()
+        self._build_shortcuts()
         self._build_menu()
-        self._build_text_area()
+        self._build_context_menu()
         self._build_status_bar()
-        self._update_title()
-
-        root.bind("<Control-n>", lambda e: self.new_file())
-        root.bind("<Control-o>", lambda e: self.open_file())
-        root.bind("<Control-s>", lambda e: self.save())
-        root.bind("<Control-S>", lambda e: self.save_as())
-        root.bind("<Control-f>", lambda e: self.find())
-        root.bind("<F3>", lambda e: self.find_next())
-        root.bind("<Control-plus>", lambda e: self.zoom(1))
-        root.bind("<Control-equal>", lambda e: self.zoom(1))
-        root.bind("<Control-minus>", lambda e: self.zoom(-1))
-        root.bind("<Control-q>", lambda e: self.exit())
+        self._build_notebook()
+        self._apply_chrome_theme()
+        self.bind_shortcuts(root)
         root.protocol("WM_DELETE_WINDOW", self.exit)
+
+    # ================= setup =================
+    @staticmethod
+    def _clamp(size):
+        try:
+            return max(MIN_SIZE, min(MAX_SIZE, int(size)))
+        except (TypeError, ValueError):
+            return DEFAULT_SIZE
 
     def _set_icon(self):
         icon = tk.PhotoImage(width=32, height=32)
@@ -47,228 +677,909 @@ class Notepad:
         self.icon = icon
         self.root.iconphoto(True, icon)
 
+    def _build_shortcuts(self):
+        keys = [
+            ("<Control-n>", self.new_tab),
+            ("<Control-o>", self.open_file),
+            ("<Control-s>", self.save),
+            ("<Control-Shift-S>", self.save_as),
+            ("<Control-p>", self.print_file),
+            ("<Control-w>", self.close_tab),
+            ("<Control-q>", self.exit),
+            ("<Control-y>", lambda: self._text_event("<<Redo>>")),
+            ("<Control-Shift-Z>", lambda: self._text_event("<<Redo>>")),
+            ("<Control-a>", self.select_all),
+            ("<Control-f>", lambda: self.show_find(False)),
+            ("<Control-h>", lambda: self.show_find(True)),
+            ("<F3>", self.find_next),
+            ("<Shift-F3>", self.find_prev),
+            ("<Control-g>", self.goto_line),
+            ("<F5>", self.insert_datetime),
+            ("<Control-plus>", lambda: self.zoom(1)),
+            ("<Control-equal>", lambda: self.zoom(1)),
+            ("<Control-KP_Add>", lambda: self.zoom(1)),
+            ("<Control-minus>", lambda: self.zoom(-1)),
+            ("<Control-KP_Subtract>", lambda: self.zoom(-1)),
+            ("<Control-0>", self.reset_zoom),
+            ("<Control-Tab>", lambda: self.cycle_tab(1)),
+            ("<Control-Shift-Tab>", lambda: self.cycle_tab(-1)),
+            ("<Control-ISO_Left_Tab>", lambda: self.cycle_tab(-1)),
+        ]
+        self.shortcuts = []
+        for seq, func in keys:
+            self.shortcuts.append((seq, func))
+            m = re.fullmatch(r"<Control-([a-z])>", seq)
+            if m:  # also works with Caps Lock on
+                self.shortcuts.append((f"<Control-{m.group(1).upper()}>", func))
+
+    def bind_shortcuts(self, widget):
+        for seq, func in self.shortcuts:
+            try:
+                widget.bind(seq, lambda e, f=func: (f(), "break")[1])
+            except tk.TclError:
+                pass
+
     def _build_menu(self):
-        menubar = tk.Menu(self.root)
+        mb = tk.Menu(self.root)
 
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="New", accelerator="Ctrl+N", command=self.new_file)
-        file_menu.add_command(label="Open...", accelerator="Ctrl+O", command=self.open_file)
-        file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save)
-        file_menu.add_command(label="Save As...", accelerator="Ctrl+Shift+S", command=self.save_as)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", accelerator="Ctrl+Q", command=self.exit)
-        menubar.add_cascade(label="File", menu=file_menu)
+        m = tk.Menu(mb, tearoff=0)
+        m.add_command(label="New Tab", accelerator="Ctrl+N", command=self.new_tab)
+        m.add_command(label="Open...", accelerator="Ctrl+O", command=self.open_file)
+        self.recent_menu = tk.Menu(m, tearoff=0)
+        m.add_cascade(label="Open Recent", menu=self.recent_menu)
+        m.add_command(label="Reload from Disk", command=self.reload)
+        m.add_separator()
+        m.add_command(label="Save", accelerator="Ctrl+S", command=self.save)
+        m.add_command(label="Save As...", accelerator="Ctrl+Shift+S", command=self.save_as)
+        m.add_separator()
+        m.add_command(label="Print...", accelerator="Ctrl+P", command=self.print_file)
+        m.add_separator()
+        m.add_command(label="Close Tab", accelerator="Ctrl+W", command=self.close_tab)
+        m.add_command(label="Exit", accelerator="Ctrl+Q", command=self.exit)
+        mb.add_cascade(label="File", menu=m)
+        self._rebuild_recent()
 
-        edit_menu = tk.Menu(menubar, tearoff=0)
-        edit_menu.add_command(label="Undo", accelerator="Ctrl+Z",
-                              command=lambda: self.text.event_generate("<<Undo>>"))
-        edit_menu.add_command(label="Redo", accelerator="Ctrl+Y",
-                              command=lambda: self.text.event_generate("<<Redo>>"))
-        edit_menu.add_separator()
-        edit_menu.add_command(label="Cut", accelerator="Ctrl+X",
-                              command=lambda: self.text.event_generate("<<Cut>>"))
-        edit_menu.add_command(label="Copy", accelerator="Ctrl+C",
-                              command=lambda: self.text.event_generate("<<Copy>>"))
-        edit_menu.add_command(label="Paste", accelerator="Ctrl+V",
-                              command=lambda: self.text.event_generate("<<Paste>>"))
-        edit_menu.add_command(label="Select All", accelerator="Ctrl+A",
-                              command=self.select_all)
-        edit_menu.add_separator()
-        edit_menu.add_command(label="Find...", accelerator="Ctrl+F", command=self.find)
-        edit_menu.add_command(label="Find Next", accelerator="F3", command=self.find_next)
-        menubar.add_cascade(label="Edit", menu=edit_menu)
+        m = tk.Menu(mb, tearoff=0)
+        m.add_command(label="Undo", accelerator="Ctrl+Z",
+                      command=lambda: self._text_event("<<Undo>>"))
+        m.add_command(label="Redo", accelerator="Ctrl+Y",
+                      command=lambda: self._text_event("<<Redo>>"))
+        m.add_separator()
+        m.add_command(label="Cut", accelerator="Ctrl+X",
+                      command=lambda: self._text_event("<<Cut>>"))
+        m.add_command(label="Copy", accelerator="Ctrl+C",
+                      command=lambda: self._text_event("<<Copy>>"))
+        m.add_command(label="Paste", accelerator="Ctrl+V",
+                      command=lambda: self._text_event("<<Paste>>"))
+        m.add_command(label="Select All", accelerator="Ctrl+A", command=self.select_all)
+        m.add_separator()
+        m.add_command(label="Find...", accelerator="Ctrl+F", command=lambda: self.show_find(False))
+        m.add_command(label="Replace...", accelerator="Ctrl+H", command=lambda: self.show_find(True))
+        m.add_command(label="Find Next", accelerator="F3", command=self.find_next)
+        m.add_command(label="Find Previous", accelerator="Shift+F3", command=self.find_prev)
+        m.add_command(label="Go To Line...", accelerator="Ctrl+G", command=self.goto_line)
+        m.add_separator()
+        m.add_command(label="Insert Date/Time", accelerator="F5", command=self.insert_datetime)
+        mb.add_cascade(label="Edit", menu=m)
 
-        view_menu = tk.Menu(menubar, tearoff=0)
-        view_menu.add_checkbutton(label="Word Wrap", variable=self.wrap,
-                                  command=self.toggle_wrap)
-        view_menu.add_command(label="Zoom In", accelerator="Ctrl++", command=lambda: self.zoom(1))
-        view_menu.add_command(label="Zoom Out", accelerator="Ctrl+-", command=lambda: self.zoom(-1))
-        menubar.add_cascade(label="View", menu=view_menu)
+        m = tk.Menu(mb, tearoff=0)
+        m.add_checkbutton(label="Word Wrap", variable=self.wrap, command=self.toggle_wrap)
+        m.add_checkbutton(label="Auto Indent", variable=self.auto_indent, command=self.save_config)
+        m.add_command(label="Font...", command=self.choose_font)
+        mb.add_cascade(label="Format", menu=m)
 
-        self.root.config(menu=menubar)
+        m = tk.Menu(mb, tearoff=0)
+        m.add_checkbutton(label="Line Numbers", variable=self.line_numbers,
+                          command=self.toggle_line_numbers)
+        m.add_checkbutton(label="Syntax Highlighting", variable=self.highlight,
+                          command=self.toggle_highlight)
+        themes = tk.Menu(m, tearoff=0)
+        for name in THEMES:
+            themes.add_radiobutton(label=name, value=name, variable=self.theme_var,
+                                   command=self.set_theme)
+        m.add_cascade(label="Theme", menu=themes)
+        m.add_separator()
+        m.add_command(label="Zoom In", accelerator="Ctrl++", command=lambda: self.zoom(1))
+        m.add_command(label="Zoom Out", accelerator="Ctrl+-", command=lambda: self.zoom(-1))
+        m.add_command(label="Reset Zoom", accelerator="Ctrl+0", command=self.reset_zoom)
+        m.add_separator()
+        m.add_command(label="Next Tab", accelerator="Ctrl+Tab", command=lambda: self.cycle_tab(1))
+        m.add_command(label="Previous Tab", accelerator="Ctrl+Shift+Tab",
+                      command=lambda: self.cycle_tab(-1))
+        mb.add_cascade(label="View", menu=m)
 
-    def _build_text_area(self):
-        frame = tk.Frame(self.root, bg=BG)
-        frame.pack(fill="both", expand=True)
+        m = tk.Menu(mb, tearoff=0)
+        for enc in ENCODINGS:
+            m.add_radiobutton(label=f"Save as {enc}", value=enc, variable=self.enc_var,
+                              command=self.set_encoding)
+        m.add_separator()
+        reopen = tk.Menu(m, tearoff=0)
+        for enc in ENCODINGS:
+            reopen.add_command(label=enc, command=lambda e=enc: self.reload(encoding=e))
+        m.add_cascade(label="Reopen with Encoding", menu=reopen)
+        m.add_separator()
+        eols = tk.Menu(m, tearoff=0)
+        for name in EOLS:
+            eols.add_radiobutton(label=name, value=name, variable=self.eol_var,
+                                 command=self.set_eol)
+        m.add_cascade(label="Line Endings", menu=eols)
+        mb.add_cascade(label="Encoding", menu=m)
 
-        self.text = tk.Text(frame, wrap="none", undo=True, maxundo=-1,
-                            font=("Consolas", self.font_size),
-                            bg=BG, fg=FG,
-                            insertbackground=FG,
-                            selectbackground=FG, selectforeground=BG,
-                            inactiveselectbackground=FG,
-                            borderwidth=0, highlightthickness=0,
-                            padx=8, pady=6)
-        sy = tk.Scrollbar(frame, orient="vertical", command=self.text.yview)
-        sx = tk.Scrollbar(frame, orient="horizontal", command=self.text.xview)
-        self.text.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        self.root.config(menu=mb)
 
-        self.text.grid(row=0, column=0, sticky="nsew")
-        sy.grid(row=0, column=1, sticky="ns")
-        sx.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        self.text.tag_configure("match", background="#FFFF55", foreground="#000000")
-        self.text.bind("<<Modified>>", lambda e: self._update_title())
-        self.text.bind("<Control-a>", lambda e: self.select_all())
-        self.text.bind("<Control-y>", lambda e: (self.text.event_generate("<<Redo>>"), "break")[1])
-        self.text.focus_set()
+    def _build_context_menu(self):
+        m = tk.Menu(self.root, tearoff=0)
+        for label, event in (("Undo", "<<Undo>>"), ("Redo", "<<Redo>>"), (None, None),
+                             ("Cut", "<<Cut>>"), ("Copy", "<<Copy>>"),
+                             ("Paste", "<<Paste>>"), ("Delete", "<<Clear>>")):
+            if label is None:
+                m.add_separator()
+            else:
+                m.add_command(label=label, command=lambda ev=event: self._text_event(ev))
+        m.add_separator()
+        m.add_command(label="Select All", command=self.select_all)
+        self.context_menu = m
 
     def _build_status_bar(self):
-        self.status = tk.Label(self.root, text="New file", anchor="w",
-                               relief="flat", padx=6, bg="#C0C0C0", fg="#000000")
-        self.status.pack(fill="x", side="bottom")
+        bar = tk.Frame(self.root)
+        self.status_right = tk.Label(bar, anchor="e", padx=6)
+        self.status = tk.Label(bar, anchor="w", padx=6, text="New file")
+        self.status_right.pack(side="right")
+        self.status.pack(side="left", fill="x", expand=True)
+        bar.pack(side="bottom", fill="x")
+        self.status_bar = bar
 
-    def _modified(self):
-        return self.text.edit_modified()
+    def _build_notebook(self):
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        if not self.aqua:
+            self.nb.bind("<Button-2>", self._on_tab_middle_click)
 
-    def _update_title(self):
-        name = os.path.basename(self.path) if self.path else "Untitled"
-        mark = "*" if self._modified() else ""
-        self.root.title(f"{mark}{name} - Notepad")
+    def _apply_chrome_theme(self):
+        th = self.theme
+        for w in (self.status_bar, self.status, self.status_right):
+            w.config(bg=th["status_bg"])
+        for w in (self.status, self.status_right):
+            w.config(fg=th["status_fg"])
 
-    def _set_content(self, content):
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", content)
-        self.text.edit_reset()
-        self.text.edit_modified(False)
-        self.text.mark_set("insert", "1.0")
-        self.text.see("1.0")
-        self._update_title()
+    # ================= config =================
+    def save_config(self):
+        self.cfg.update(
+            font_family=self.font.cget("family"), font_size=self.font_size,
+            wrap=self.wrap.get(), auto_indent=self.auto_indent.get(),
+            line_numbers=self.line_numbers.get(),
+            highlight=self.highlight.get(),
+            theme=self.theme_var.get(), match_case=self.opt_case.get(),
+            whole_word=self.opt_word.get(), regex=self.opt_regex.get())
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, indent=2)
+        except OSError:
+            pass
 
-    def _confirm_discard(self):
-        if not self._modified():
-            return True
-        answer = messagebox.askyesnocancel("Notepad", "Save changes before continuing?")
-        if answer is None:
-            return False
-        if answer:
-            return self.save()
-        return True
-
-    def new_file(self):
-        if not self._confirm_discard():
+    def _rebuild_recent(self):
+        m = self.recent_menu
+        m.delete(0, "end")
+        recent = self.cfg.get("recent", [])
+        if not recent:
+            m.add_command(label="(empty)", state="disabled")
             return
-        self.path = None
-        self.encoding = "utf-8"
-        self._set_content("")
-        self.status.config(text="New file")
+        for i, path in enumerate(recent, 1):
+            m.add_command(label=f"{i}. {path}", underline=0 if i < 10 else -1,
+                          command=lambda p=path: self.open_file(p))
+        m.add_separator()
+        m.add_command(label="Clear List", command=self._clear_recent)
 
-    def open_file(self, path=None):
-        if not self._confirm_discard():
+    def _add_recent(self, path):
+        key = os.path.normcase(path)
+        recent = [p for p in self.cfg.get("recent", []) if os.path.normcase(p) != key]
+        self.cfg["recent"] = [path] + recent[:MAX_RECENT - 1]
+        self._rebuild_recent()
+        self.save_config()
+
+    def _remove_recent(self, path):
+        key = os.path.normcase(path)
+        self.cfg["recent"] = [p for p in self.cfg.get("recent", []) if os.path.normcase(p) != key]
+        self._rebuild_recent()
+        self.save_config()
+
+    def _clear_recent(self):
+        self.cfg["recent"] = []
+        self._rebuild_recent()
+        self.save_config()
+
+    # ================= tabs =================
+    def current(self):
+        tab = self.nb.select()
+        return self.docs.get(tab) if tab else None
+
+    def new_tab(self):
+        self._untitled += 1
+        title = "Untitled" if self._untitled == 1 else f"Untitled {self._untitled}"
+        doc = Document(self, title)
+        self.docs[str(doc.frame)] = doc
+        self.nb.add(doc.frame, text=doc.name())
+        self.nb.select(doc.frame)
+        doc.text.focus_set()
+        return doc
+
+    def close_tab(self, doc=None):
+        doc = doc or self.current()
+        if not doc:
             return
-        if not path:
-            path = filedialog.askopenfilename(title="Open File", filetypes=FILETYPES)
-            if not path:
-                return
+        self.nb.select(doc.frame)
+        if not self._confirm_discard(doc):
+            return
+        self._remove_recovery(doc)
+        self.nb.forget(doc.frame)
+        del self.docs[str(doc.frame)]
+        doc.destroy()
+        if not self.docs:
+            self.new_tab()
+
+    def cycle_tab(self, step):
+        tabs = self.nb.tabs()
+        if len(tabs) > 1:
+            i = tabs.index(self.nb.select())
+            self.nb.select(tabs[(i + step) % len(tabs)])
+
+    def update_tab(self, doc):
+        mark = " *" if doc.modified() else ""
+        try:
+            self.nb.tab(doc.frame, text=f"{doc.name()}{mark}")
+        except tk.TclError:
+            return
+        if self.current() is doc:
+            self.update_title()
+
+    def update_title(self):
+        doc = self.current()
+        if doc:
+            mark = "*" if doc.modified() else ""
+            self.root.title(f"{mark}{doc.name()} - {APP}")
+
+    def _on_tab_changed(self, event=None):
+        doc = self.current()
+        if not doc:
+            return
+        self.enc_var.set(doc.encoding)
+        self.eol_var.set(EOL_NAMES[doc.eol])
+        self.update_title()
+        self.update_status()
+        self.set_message(doc.path or "New file")
+        doc.text.focus_set()
+        doc.text.after_idle(doc.redraw_gutter)
+
+    def _on_tab_middle_click(self, event):
+        try:
+            idx = self.nb.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return
+        if isinstance(idx, int):
+            self.close_tab(self.docs[self.nb.tabs()[idx]])
+
+    # ================= status =================
+    def set_message(self, text):
+        self.status.config(text=text)
+
+    def update_status(self):
+        doc = self.current()
+        if not doc:
+            return
+        t = doc.text
+        line, col = t.index("insert").split(".")
+        sel = t.tag_ranges("sel")
+        if sel:
+            s = t.get(sel[0], sel[1])
+            counts = f"Sel: {len(s):,} chars, {len(s.split()):,} words"
+        else:
+            counts = f"{doc.words:,} words, {doc.chars:,} chars"
+        self.status_right.config(
+            text=f"Ln {line}, Col {int(col) + 1}   |   {counts}   |   "
+                 f"{doc.encoding}   |   {EOL_NAMES[doc.eol]}   |   {self.font_size}pt")
+
+    # ================= files =================
+    def _read(self, path, encoding=None):
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
             messagebox.showerror("Error", f"Could not open file:\n{e}")
+            return None
+        content, enc = decode_bytes(data, encoding)
+        return content, enc, len(data)
+
+    def _find_open(self, path):
+        key = os.path.normcase(path)
+        for doc in self.docs.values():
+            if doc.path and os.path.normcase(doc.path) == key:
+                return doc
+        return None
+
+    def open_file(self, path=None):
+        if not path:
+            paths = filedialog.askopenfilenames(title="Open File", filetypes=FILETYPES)
+            if isinstance(paths, str):
+                paths = self.root.tk.splitlist(paths)
+            for p in paths:
+                self.open_file(p)
             return
+        path = os.path.abspath(path)
+        existing = self._find_open(path)
+        if existing:
+            self.nb.select(existing.frame)
+            return
+        result = self._read(path)
+        if result is None:
+            self._remove_recent(path)
+            return
+        cur = self.current()
+        doc = cur if cur and cur.is_blank() else self.new_tab()
+        doc.load(path, *result)
+        self._on_tab_changed()
+        self._add_recent(path)
 
-        content, encoding = None, None
-        for enc in ENCODINGS:
-            try:
-                content = data.decode(enc)
-                encoding = enc
-                break
-            except UnicodeDecodeError:
-                continue
-        if content is None:
-            content = data.decode("utf-8", errors="replace")
-            encoding = "utf-8"
+    def reload(self, doc=None, encoding=None, ask=True):
+        doc = doc or self.current()
+        if not doc or not doc.path:
+            self.set_message("This document has not been saved yet")
+            return
+        if ask and doc.modified() and not messagebox.askyesno(
+                APP, f"Discard unsaved changes to {doc.name()} and reload from disk?"):
+            return
+        result = self._read(doc.path, encoding)
+        if result:
+            doc.load(doc.path, *result)
+            self._remove_recovery(doc)
+            self._on_tab_changed()
 
-        self.path = path
-        self.encoding = encoding
-        self._set_content(content)
-        lines = content.count("\n") + 1
-        self.status.config(
-            text=f"{path}   |   {lines} lines   |   {len(data):,} bytes   |   {encoding}")
+    def save(self, doc=None):
+        doc = doc or self.current()
+        if not doc:
+            return False
+        if not doc.path:
+            return self.save_as(doc)
+        return self._write(doc, doc.path)
 
-    def save(self):
-        if not self.path:
-            return self.save_as()
-        return self._write(self.path)
-
-    def save_as(self):
+    def save_as(self, doc=None):
+        doc = doc or self.current()
+        if not doc:
+            return False
         path = filedialog.asksaveasfilename(
-            title="Save As",
-            defaultextension=".txt",
-            initialfile=os.path.basename(self.path) if self.path else "Untitled.txt",
+            title="Save As", defaultextension=".txt",
+            initialfile=doc.name() if doc.path else "Untitled.txt",
+            initialdir=os.path.dirname(doc.path) if doc.path else None,
             filetypes=FILETYPES)
         if not path:
             return False
-        return self._write(path)
+        return self._write(doc, path)
 
-    def _write(self, path):
-        content = self.text.get("1.0", "end-1c")
+    def _write(self, doc, path):
+        content = doc.content()
+        if doc.eol != "\n":
+            content = content.replace("\n", doc.eol)
         try:
-            with open(path, "w", encoding=self.encoding, newline="") as f:
+            with open(path, "w", encoding=doc.encoding, newline="") as f:
                 f.write(content)
-        except (OSError, UnicodeEncodeError) as e:
+        except UnicodeEncodeError as e:
+            messagebox.showerror(
+                "Error", f"The text contains characters that {doc.encoding} cannot store:\n{e}\n\n"
+                         "Choose UTF-8 in the Encoding menu and save again.")
+            return False
+        except OSError as e:
             messagebox.showerror("Error", f"Could not save file:\n{e}")
             return False
-        self.path = path
-        self.text.edit_modified(False)
-        self._update_title()
-        self.status.config(text=f"Saved: {path}   |   {self.encoding}")
+        doc.path = os.path.abspath(path)
+        try:
+            doc.mtime = os.path.getmtime(doc.path)
+        except OSError:
+            doc.mtime = None
+        doc.text.edit_modified(False)
+        doc.setup_lexer()
+        self.update_tab(doc)
+        self._remove_recovery(doc)
+        self._add_recent(doc.path)
+        self.set_message(f"Saved: {doc.path}")
         return True
 
-    def exit(self):
-        if self._confirm_discard():
-            self.root.destroy()
+    def _confirm_discard(self, doc):
+        if not doc.modified():
+            return True
+        answer = messagebox.askyesnocancel(APP, f"Save changes to {doc.name()}?")
+        if answer is None:
+            return False
+        if answer:
+            return self.save(doc)
+        return True
+
+    def set_encoding(self):
+        doc = self.current()
+        if doc:
+            doc.encoding = self.enc_var.get()
+            self.update_status()
+            self.set_message(f"Encoding set to {doc.encoding}; it will be used on next save")
+
+    def set_eol(self):
+        doc = self.current()
+        if doc:
+            doc.eol = EOLS[self.eol_var.get()]
+            self.update_status()
+            self.set_message(f"Line endings set to {self.eol_var.get()}; "
+                             "they will be used on next save")
+
+    def print_file(self):
+        doc = self.current()
+        if not doc:
+            return
+        content = doc.content()
+        if not content.strip():
+            self.set_message("Nothing to print")
+            return
+        if not messagebox.askyesno(APP, f"Send {doc.name()} to the default printer?"):
+            return
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="notepad_", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8-sig" if sys.platform == "win32" else "utf-8",
+                           newline="") as f:
+                f.write(content.replace("\n", DEFAULT_EOL))
+            if sys.platform == "win32":
+                os.startfile(tmp, "print")
+            else:
+                subprocess.run(["lpr", tmp], check=True)
+        except (OSError, subprocess.CalledProcessError) as e:
+            messagebox.showerror("Error", f"Could not print:\n{e}")
+            return
+        self.set_message("Sent to printer")
+
+    # ================= recovery & disk checks =================
+    def _recovery_path(self, doc):
+        return os.path.join(RECOVERY_DIR, doc.id + ".json")
+
+    def _remove_recovery(self, doc):
+        try:
+            os.remove(self._recovery_path(doc))
+        except OSError:
+            pass
+
+    def _write_recovery(self):
+        try:
+            os.makedirs(RECOVERY_DIR, exist_ok=True)
+            for doc in self.docs.values():
+                if doc.modified():
+                    data = {"path": doc.path, "title": doc.name(), "encoding": doc.encoding,
+                            "eol": EOL_NAMES[doc.eol], "content": doc.content()}
+                    with open(self._recovery_path(doc), "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+                else:
+                    self._remove_recovery(doc)
+        except OSError:
+            pass
+
+    def _recovery_tick(self):
+        self._write_recovery()
+        self.root.after(RECOVERY_INTERVAL, self._recovery_tick)
+
+    def _recover(self):
+        try:
+            files = [os.path.join(RECOVERY_DIR, f) for f in os.listdir(RECOVERY_DIR)
+                     if f.endswith(".json")]
+        except OSError:
+            return
+        if not files:
+            return
+        if messagebox.askyesno(APP, f"Found {len(files)} unsaved document(s) from a previous "
+                                    "session.\nDo you want to restore them?"):
+            for path in files:
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        data = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                doc = self.new_tab()
+                doc.set_content(data.get("content", ""))
+                doc.path = data.get("path")
+                doc.encoding = data.get("encoding") or "utf-8"
+                doc.eol = EOLS.get(data.get("eol"), DEFAULT_EOL)
+                try:
+                    doc.mtime = os.path.getmtime(doc.path) if doc.path else None
+                except OSError:
+                    doc.mtime = None
+                doc.text.edit_modified(True)
+                doc.setup_lexer()
+                self.update_tab(doc)
+        for path in files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _disk_tick(self):
+        if not self._checking:
+            self._checking = True
+            try:
+                self._check_disk()
+            finally:
+                self._checking = False
+        self.root.after(DISK_CHECK_INTERVAL, self._disk_tick)
+
+    def _check_disk(self):
+        for doc in list(self.docs.values()):
+            if not doc.path or doc.mtime is None:
+                continue
+            try:
+                mtime = os.path.getmtime(doc.path)
+            except OSError:
+                doc.mtime = None
+                self.nb.select(doc.frame)
+                messagebox.showwarning(APP, f"{doc.path}\n\nwas deleted or moved. "
+                                            "Save it to keep its contents.")
+                doc.text.edit_modified(True)
+                continue
+            if mtime == doc.mtime:
+                continue
+            doc.mtime = mtime
+            self.nb.select(doc.frame)
+            if doc.modified():
+                msg = (f"{doc.path}\n\nwas changed by another program and you have unsaved "
+                       "changes.\nReload it and lose your changes?")
+            else:
+                msg = f"{doc.path}\n\nwas changed by another program. Reload it?"
+            if messagebox.askyesno(APP, msg):
+                self.reload(doc, ask=False)
+
+    # ================= editing =================
+    def _text_event(self, name):
+        doc = self.current()
+        if doc:
+            doc.text.focus_set()
+            doc.text.event_generate(name)
 
     def select_all(self):
-        self.text.tag_add("sel", "1.0", "end")
+        doc = self.current()
+        if doc:
+            doc.text.tag_add("sel", "1.0", "end-1c")
+            self.update_status()
+
+    def insert_datetime(self):
+        doc = self.current()
+        if doc:
+            doc.text.insert("insert", time.strftime("%H:%M %d/%m/%Y"))
+
+    def goto_line(self):
+        doc = self.current()
+        if not doc:
+            return
+        last = int(doc.text.index("end-1c").split(".")[0])
+        line = simpledialog.askinteger("Go To Line", f"Line number (1-{last}):",
+                                       parent=self.root, minvalue=1, maxvalue=last)
+        if line:
+            t = doc.text
+            t.tag_remove("sel", "1.0", "end")
+            t.mark_set("insert", f"{line}.0")
+            t.see("insert")
+            t.focus_set()
+
+    def show_context_menu(self, event):
+        doc = self.current()
+        if doc:
+            doc.text.focus_set()
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    # ================= view =================
+    def zoom(self, delta):
+        self.set_font_size(self.font_size + delta)
+
+    def reset_zoom(self):
+        self.set_font_size(self.cfg.get("base_size", DEFAULT_SIZE))
+
+    def on_ctrl_wheel(self, event):
+        up = event.num == 4 or (event.num != 5 and event.delta > 0)
+        self.zoom(1 if up else -1)
         return "break"
 
+    def set_font_size(self, size):
+        self.font_size = self._clamp(size)
+        self.font.configure(size=self.font_size)
+        for doc in self.docs.values():
+            doc.text.after_idle(doc.redraw_gutter)
+        self.update_status()
+        self.save_config()
+
     def toggle_wrap(self):
-        self.text.config(wrap="word" if self.wrap.get() else "none")
+        mode = "word" if self.wrap.get() else "none"
+        for doc in self.docs.values():
+            doc.text.config(wrap=mode)
+            doc.text.after_idle(doc.redraw_gutter)
+        self.save_config()
 
-    def zoom(self, delta):
-        self.font_size = max(6, min(48, self.font_size + delta))
-        self.text.config(font=("Consolas", self.font_size))
+    def toggle_line_numbers(self):
+        for doc in self.docs.values():
+            if self.line_numbers.get():
+                doc.gutter.grid()
+                doc.text.after_idle(doc.redraw_gutter)
+            else:
+                doc.gutter.grid_remove()
+        self.save_config()
 
-    def find(self):
-        window = tk.Toplevel(self.root)
-        window.title("Find")
-        window.transient(self.root)
-        window.resizable(False, False)
-        tk.Label(window, text="Find:").pack(side="left", padx=6, pady=8)
-        entry = tk.Entry(window, width=30)
-        entry.insert(0, self.last_search)
-        entry.pack(side="left", padx=4)
+    def toggle_highlight(self):
+        for doc in self.docs.values():
+            doc.highlight()
+        self.save_config()
+
+    def set_theme(self):
+        self.theme = THEMES[self.theme_var.get()]
+        self._apply_chrome_theme()
+        for doc in self.docs.values():
+            doc.apply_theme()
+        self.save_config()
+
+    def choose_font(self):
+        win = tk.Toplevel(self.root)
+        win.title("Font")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        families = sorted({f for f in tkfont.families() if not f.startswith("@")}, key=str.lower)
+        current = self.font.cget("family")
+        frame = tk.Frame(win)
+        frame.grid(row=0, column=0, columnspan=2, padx=8, pady=8)
+        lb = tk.Listbox(frame, height=14, width=34, exportselection=False)
+        sb = tk.Scrollbar(frame, command=lb.yview)
+        lb.config(yscrollcommand=sb.set)
+        lb.pack(side="left")
+        sb.pack(side="left", fill="y")
+        for f in families:
+            lb.insert("end", f)
+        if current in families:
+            i = families.index(current)
+            lb.selection_set(i)
+            lb.see(i)
+
+        tk.Label(win, text="Size:").grid(row=1, column=0, sticky="e", padx=4)
+        size_var = tk.StringVar(value=str(self.font_size))
+        tk.Spinbox(win, from_=MIN_SIZE, to=MAX_SIZE, textvariable=size_var,
+                   width=5).grid(row=1, column=1, sticky="w")
+        preview_font = tkfont.Font(win, family=current, size=self.font_size)
+        tk.Label(win, text="AaBbCc 0123 {}[]() ñáé", font=preview_font,
+                 width=26).grid(row=2, column=0, columnspan=2, pady=8)
+
+        def selection():
+            sel = lb.curselection()
+            fam = lb.get(sel[0]) if sel else current
+            return fam, self._clamp(size_var.get() or self.font_size)
+
+        def update(*_):
+            fam, size = selection()
+            preview_font.configure(family=fam, size=size)
+
+        def ok():
+            fam, size = selection()
+            self.font.configure(family=fam)
+            self.cfg["base_size"] = size
+            self.set_font_size(size)
+            win.destroy()
+
+        lb.bind("<<ListboxSelect>>", update)
+        size_var.trace_add("write", update)
+        buttons = tk.Frame(win)
+        buttons.grid(row=3, column=0, columnspan=2, pady=(0, 8))
+        tk.Button(buttons, text="OK", width=10, command=ok).pack(side="left", padx=4)
+        tk.Button(buttons, text="Cancel", width=10, command=win.destroy).pack(side="left", padx=4)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
+
+    # ================= find & replace =================
+    def _build_find_dialog(self):
+        w = tk.Toplevel(self.root)
+        w.title("Find & Replace")
+        w.transient(self.root)
+        w.resizable(False, False)
+        w.protocol("WM_DELETE_WINDOW", w.withdraw)
+
+        tk.Label(w, text="Find:").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        self.find_entry = tk.Entry(w, width=34, textvariable=self.find_var)
+        self.find_entry.grid(row=0, column=1, padx=4, pady=4)
+        tk.Label(w, text="Replace:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        self.replace_entry = tk.Entry(w, width=34, textvariable=self.replace_var)
+        self.replace_entry.grid(row=1, column=1, padx=4, pady=4)
+
+        opts = tk.Frame(w)
+        opts.grid(row=2, column=1, sticky="w")
+        for text, var in (("Match case", self.opt_case), ("Whole word", self.opt_word),
+                          ("Regex", self.opt_regex)):
+            tk.Checkbutton(opts, text=text, variable=var,
+                           command=self.save_config).pack(side="left")
+
+        btns = tk.Frame(w)
+        btns.grid(row=0, column=2, rowspan=4, sticky="n", padx=6, pady=4)
+        for text, cmd in (("Find Next", self.find_next), ("Find Previous", self.find_prev),
+                          ("Replace", self.replace_one), ("Replace All", self.replace_all),
+                          ("Close", w.withdraw)):
+            tk.Button(btns, text=text, width=13, command=cmd).pack(fill="x", pady=1)
+
+        for entry in (self.find_entry, self.replace_entry):
+            entry.bind("<Return>", lambda e: self.find_next())
+            entry.bind("<Shift-Return>", lambda e: self.find_prev())
+        w.bind("<Escape>", lambda e: w.withdraw())
+        w.bind("<F3>", lambda e: self.find_next())
+        w.bind("<Shift-F3>", lambda e: self.find_prev())
+        self.find_win = w
+
+    def show_find(self, replace=False):
+        if self.find_win is None:
+            self._build_find_dialog()
+        doc = self.current()
+        if doc and doc.text.tag_ranges("sel"):
+            selected = doc.text.get("sel.first", "sel.last")
+            if selected and "\n" not in selected and len(selected) < 200:
+                self.find_var.set(selected)
+        self.find_win.deiconify()
+        self.find_win.lift()
+        entry = self.replace_entry if replace and self.find_var.get() else self.find_entry
         entry.focus_set()
         entry.select_range(0, "end")
 
-        def run(event=None):
-            self.last_search = entry.get()
-            self.text.mark_set("insert", "1.0")
-            self.find_next()
+    def _pattern(self):
+        term = self.find_var.get()
+        if not term:
+            return None
+        pat = term if self.opt_regex.get() else re.escape(term)
+        if self.opt_word.get():
+            pat = rf"\b(?:{pat})\b"
+        flags = re.MULTILINE | (0 if self.opt_case.get() else re.IGNORECASE)
+        try:
+            return re.compile(pat, flags)
+        except re.error as e:
+            self.set_message(f"Invalid regular expression: {e}")
+            self.root.bell()
+            return None
 
-        tk.Button(window, text="Find", command=run).pack(side="left", padx=6)
-        entry.bind("<Return>", run)
-        window.bind("<Escape>", lambda e: window.destroy())
+    @staticmethod
+    def _offset(text, index):
+        return len(text.get("1.0", index))
+
+    def _search(self, backward=False):
+        doc = self.current()
+        if not doc:
+            return False
+        if not self.find_var.get():
+            self.show_find()
+            return False
+        pattern = self._pattern()
+        if not pattern:
+            return False
+        t = doc.text
+        content = doc.content()
+        sel = t.tag_ranges("sel")
+        if sel:
+            start, end = self._offset(t, sel[0]), self._offset(t, sel[1])
+        else:
+            start = end = self._offset(t, "insert")
+
+        def nonempty(it):
+            return [m for m in it if m.end() > m.start()]
+
+        wrapped = False
+        if backward:
+            found = nonempty(pattern.finditer(content, 0, start))
+            if not found:
+                found, wrapped = nonempty(pattern.finditer(content)), True
+            m = found[-1] if found else None
+        else:
+            m = next((x for x in pattern.finditer(content, end) if x.end() > x.start()), None)
+            if not m:
+                wrapped = True
+                m = next((x for x in pattern.finditer(content) if x.end() > x.start()), None)
+        if not m:
+            self.set_message(f"Not found: {self.find_var.get()}")
+            self.root.bell()
+            return False
+        s, e = f"1.0+{m.start()}c", f"1.0+{m.end()}c"
+        t.tag_remove("sel", "1.0", "end")
+        t.tag_add("sel", s, e)
+        t.mark_set("insert", s if backward else e)
+        t.see(s)
+        line = t.index(s).split(".")[0]
+        self.set_message(("Search wrapped around - " if wrapped else "") + f"found at line {line}")
+        return True
 
     def find_next(self):
-        term = self.last_search
-        if not term:
-            return self.find()
-        self.text.tag_remove("match", "1.0", "end")
-        start = self.text.index("insert")
-        pos = self.text.search(term, start, nocase=True, stopindex="end")
-        if not pos:
-            pos = self.text.search(term, "1.0", nocase=True, stopindex="end")
-        if not pos:
-            self.status.config(text=f"Not found: {term}")
+        return self._search(False)
+
+    def find_prev(self):
+        return self._search(True)
+
+    def _replacement(self, match):
+        repl = self.replace_var.get()
+        return match.expand(repl) if self.opt_regex.get() else repl
+
+    def replace_one(self):
+        doc = self.current()
+        pattern = self._pattern()
+        if not doc or not pattern:
             return
-        end = f"{pos}+{len(term)}c"
-        self.text.tag_add("match", pos, end)
-        self.text.mark_set("insert", end)
-        self.text.see(pos)
+        t = doc.text
+        sel = t.tag_ranges("sel")
+        if sel:
+            first, last = t.index(sel[0]), t.index(sel[1])
+            m = pattern.fullmatch(t.get(first, last))
+            if m:
+                try:
+                    repl = self._replacement(m)
+                except (re.error, IndexError) as e:
+                    self.set_message(f"Bad replacement: {e}")
+                    return
+                t.edit_separator()
+                t.delete(first, last)
+                t.insert(first, repl)
+                t.mark_set("insert", f"{first}+{len(repl)}c")
+                t.edit_separator()
+        self._search(False)
+
+    def replace_all(self):
+        doc = self.current()
+        pattern = self._pattern()
+        if not doc or not pattern:
+            return
+        t = doc.text
+        try:
+            new, count = pattern.subn(self._replacement, doc.content())
+        except (re.error, IndexError) as e:
+            self.set_message(f"Bad replacement: {e}")
+            return
+        if not count:
+            self.set_message(f"Not found: {self.find_var.get()}")
+            self.root.bell()
+            return
+        pos = t.index("insert")
+        t.config(autoseparators=False)
+        t.edit_separator()
+        t.delete("1.0", "end")
+        t.insert("1.0", new)
+        t.edit_separator()
+        t.config(autoseparators=True)
+        t.mark_set("insert", pos)
+        t.see("insert")
+        self.set_message(f"Replaced {count:,} occurrence(s)")
+
+    # ================= lifecycle =================
+    def start(self, paths):
+        self._recover()
+        for path in paths:
+            if os.path.isfile(path):
+                self.open_file(path)
+            else:
+                self.set_message(f"File not found: {path}")
+        if not self.docs:
+            self.new_tab()
+        self.root.after(RECOVERY_INTERVAL, self._recovery_tick)
+        self.root.after(DISK_CHECK_INTERVAL, self._disk_tick)
+
+    def exit(self):
+        for tab in self.nb.tabs():
+            doc = self.docs[tab]
+            if doc.modified():
+                self.nb.select(doc.frame)
+                if not self._confirm_discard(doc):
+                    return
+        for doc in self.docs.values():
+            self._remove_recovery(doc)
+        maximized = False
+        try:
+            maximized = self.root.state() == "zoomed"
+        except tk.TclError:
+            pass
+        self.cfg["maximized"] = maximized
+        if not maximized:
+            self.cfg["geometry"] = self.root.geometry()
+        self.save_config()
+        self.root.destroy()
+
 
 def main():
     if sys.platform == "win32":
@@ -279,9 +1590,9 @@ def main():
             pass
     root = tk.Tk()
     app = Notepad(root)
-    if len(sys.argv) > 1:
-        app.open_file(sys.argv[1])
+    app.start(sys.argv[1:])
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
