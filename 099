@@ -1,0 +1,284 @@
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+FILETYPES = [("Text files", "*.txt *.md *.py *.csv *.json *.log *.ini *.xml *.html"),
+             ("All files", "*.*")]
+BG = "#001040"
+FG = "#FFFFFF"
+
+
+class Notepad:
+    def __init__(self, root):
+        self.root = root
+        self.root.geometry("900x600")
+        self.font_size = 11
+        self.wrap = tk.BooleanVar(value=False)
+        self.last_search = ""
+        self.path = None
+        self.encoding = "utf-8"
+
+        self._set_icon()
+        self._build_menu()
+        self._build_text_area()
+        self._build_status_bar()
+        self._update_title()
+
+        root.bind("<Control-n>", lambda e: self.new_file())
+        root.bind("<Control-o>", lambda e: self.open_file())
+        root.bind("<Control-s>", lambda e: self.save())
+        root.bind("<Control-S>", lambda e: self.save_as())
+        root.bind("<Control-f>", lambda e: self.find())
+        root.bind("<F3>", lambda e: self.find_next())
+        root.bind("<Control-plus>", lambda e: self.zoom(1))
+        root.bind("<Control-equal>", lambda e: self.zoom(1))
+        root.bind("<Control-minus>", lambda e: self.zoom(-1))
+        root.bind("<Control-q>", lambda e: self.exit())
+        root.protocol("WM_DELETE_WINDOW", self.exit)
+
+    def _set_icon(self):
+        icon = tk.PhotoImage(width=32, height=32)
+        icon.put("{#C0C0C0}", to=(4, 1, 28, 31))
+        icon.put("{" + BG + "}", to=(5, 2, 27, 30))
+        icon.put("{#FFFF55}", to=(5, 2, 27, 5))
+        for y, end in ((9, 24), (13, 22), (17, 24), (21, 19), (25, 23)):
+            icon.put("{" + FG + "}", to=(8, y, end, y + 2))
+        self.icon = icon
+        self.root.iconphoto(True, icon)
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="New", accelerator="Ctrl+N", command=self.new_file)
+        file_menu.add_command(label="Open...", accelerator="Ctrl+O", command=self.open_file)
+        file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save)
+        file_menu.add_command(label="Save As...", accelerator="Ctrl+Shift+S", command=self.save_as)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", accelerator="Ctrl+Q", command=self.exit)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(label="Undo", accelerator="Ctrl+Z",
+                              command=lambda: self.text.event_generate("<<Undo>>"))
+        edit_menu.add_command(label="Redo", accelerator="Ctrl+Y",
+                              command=lambda: self.text.event_generate("<<Redo>>"))
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Cut", accelerator="Ctrl+X",
+                              command=lambda: self.text.event_generate("<<Cut>>"))
+        edit_menu.add_command(label="Copy", accelerator="Ctrl+C",
+                              command=lambda: self.text.event_generate("<<Copy>>"))
+        edit_menu.add_command(label="Paste", accelerator="Ctrl+V",
+                              command=lambda: self.text.event_generate("<<Paste>>"))
+        edit_menu.add_command(label="Select All", accelerator="Ctrl+A",
+                              command=self.select_all)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Find...", accelerator="Ctrl+F", command=self.find)
+        edit_menu.add_command(label="Find Next", accelerator="F3", command=self.find_next)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_checkbutton(label="Word Wrap", variable=self.wrap,
+                                  command=self.toggle_wrap)
+        view_menu.add_command(label="Zoom In", accelerator="Ctrl++", command=lambda: self.zoom(1))
+        view_menu.add_command(label="Zoom Out", accelerator="Ctrl+-", command=lambda: self.zoom(-1))
+        menubar.add_cascade(label="View", menu=view_menu)
+
+        self.root.config(menu=menubar)
+
+    def _build_text_area(self):
+        frame = tk.Frame(self.root, bg=BG)
+        frame.pack(fill="both", expand=True)
+
+        self.text = tk.Text(frame, wrap="none", undo=True, maxundo=-1,
+                            font=("Consolas", self.font_size),
+                            bg=BG, fg=FG,
+                            insertbackground=FG,
+                            selectbackground=FG, selectforeground=BG,
+                            inactiveselectbackground=FG,
+                            borderwidth=0, highlightthickness=0,
+                            padx=8, pady=6)
+        sy = tk.Scrollbar(frame, orient="vertical", command=self.text.yview)
+        sx = tk.Scrollbar(frame, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+
+        self.text.grid(row=0, column=0, sticky="nsew")
+        sy.grid(row=0, column=1, sticky="ns")
+        sx.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        self.text.tag_configure("match", background="#FFFF55", foreground="#000000")
+        self.text.bind("<<Modified>>", lambda e: self._update_title())
+        self.text.bind("<Control-a>", lambda e: self.select_all())
+        self.text.bind("<Control-y>", lambda e: (self.text.event_generate("<<Redo>>"), "break")[1])
+        self.text.focus_set()
+
+    def _build_status_bar(self):
+        self.status = tk.Label(self.root, text="New file", anchor="w",
+                               relief="flat", padx=6, bg="#C0C0C0", fg="#000000")
+        self.status.pack(fill="x", side="bottom")
+
+    def _modified(self):
+        return self.text.edit_modified()
+
+    def _update_title(self):
+        name = os.path.basename(self.path) if self.path else "Untitled"
+        mark = "*" if self._modified() else ""
+        self.root.title(f"{mark}{name} - Notepad")
+
+    def _set_content(self, content):
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", content)
+        self.text.edit_reset()
+        self.text.edit_modified(False)
+        self.text.mark_set("insert", "1.0")
+        self.text.see("1.0")
+        self._update_title()
+
+    def _confirm_discard(self):
+        if not self._modified():
+            return True
+        answer = messagebox.askyesnocancel("Notepad", "Save changes before continuing?")
+        if answer is None:
+            return False
+        if answer:
+            return self.save()
+        return True
+
+    def new_file(self):
+        if not self._confirm_discard():
+            return
+        self.path = None
+        self.encoding = "utf-8"
+        self._set_content("")
+        self.status.config(text="New file")
+
+    def open_file(self, path=None):
+        if not self._confirm_discard():
+            return
+        if not path:
+            path = filedialog.askopenfilename(title="Open File", filetypes=FILETYPES)
+            if not path:
+                return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not open file:\n{e}")
+            return
+
+        content, encoding = None, None
+        for enc in ENCODINGS:
+            try:
+                content = data.decode(enc)
+                encoding = enc
+                break
+            except UnicodeDecodeError:
+                continue
+        if content is None:
+            content = data.decode("utf-8", errors="replace")
+            encoding = "utf-8"
+
+        self.path = path
+        self.encoding = encoding
+        self._set_content(content)
+        lines = content.count("\n") + 1
+        self.status.config(
+            text=f"{path}   |   {lines} lines   |   {len(data):,} bytes   |   {encoding}")
+
+    def save(self):
+        if not self.path:
+            return self.save_as()
+        return self._write(self.path)
+
+    def save_as(self):
+        path = filedialog.asksaveasfilename(
+            title="Save As",
+            defaultextension=".txt",
+            initialfile=os.path.basename(self.path) if self.path else "Untitled.txt",
+            filetypes=FILETYPES)
+        if not path:
+            return False
+        return self._write(path)
+
+    def _write(self, path):
+        content = self.text.get("1.0", "end-1c")
+        try:
+            with open(path, "w", encoding=self.encoding, newline="") as f:
+                f.write(content)
+        except (OSError, UnicodeEncodeError) as e:
+            messagebox.showerror("Error", f"Could not save file:\n{e}")
+            return False
+        self.path = path
+        self.text.edit_modified(False)
+        self._update_title()
+        self.status.config(text=f"Saved: {path}   |   {self.encoding}")
+        return True
+
+    def exit(self):
+        if self._confirm_discard():
+            self.root.destroy()
+
+    def select_all(self):
+        self.text.tag_add("sel", "1.0", "end")
+        return "break"
+
+    def toggle_wrap(self):
+        self.text.config(wrap="word" if self.wrap.get() else "none")
+
+    def zoom(self, delta):
+        self.font_size = max(6, min(48, self.font_size + delta))
+        self.text.config(font=("Consolas", self.font_size))
+
+    def find(self):
+        window = tk.Toplevel(self.root)
+        window.title("Find")
+        window.transient(self.root)
+        window.resizable(False, False)
+        tk.Label(window, text="Find:").pack(side="left", padx=6, pady=8)
+        entry = tk.Entry(window, width=30)
+        entry.insert(0, self.last_search)
+        entry.pack(side="left", padx=4)
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        def run(event=None):
+            self.last_search = entry.get()
+            self.text.mark_set("insert", "1.0")
+            self.find_next()
+
+        tk.Button(window, text="Find", command=run).pack(side="left", padx=6)
+        entry.bind("<Return>", run)
+        window.bind("<Escape>", lambda e: window.destroy())
+
+    def find_next(self):
+        term = self.last_search
+        if not term:
+            return self.find()
+        self.text.tag_remove("match", "1.0", "end")
+        start = self.text.index("insert")
+        pos = self.text.search(term, start, nocase=True, stopindex="end")
+        if not pos:
+            pos = self.text.search(term, "1.0", nocase=True, stopindex="end")
+        if not pos:
+            self.status.config(text=f"Not found: {term}")
+            return
+        end = f"{pos}+{len(term)}c"
+        self.text.tag_add("match", pos, end)
+        self.text.mark_set("insert", end)
+        self.text.see(pos)
+
+
+def main():
+    root = tk.Tk()
+    app = Notepad(root)
+    if len(sys.argv) > 1:
+        app.open_file(sys.argv[1])
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
