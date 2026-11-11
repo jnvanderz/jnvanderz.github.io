@@ -147,7 +147,7 @@
 <script>
 "use strict";
 
-const TOPIC  = "jnvanderz.github.io/mqttchat";
+const TOPIC  = "https://jnvanderz.github.io/mqttchat";
 const BROKER = "wss://test.mosquitto.org:8081";
 
 // CRYPTO-BEGIN
@@ -156,7 +156,7 @@ const BROKER = "wss://test.mosquitto.org:8081";
 //   public key --SHA-256 with fixed salt--> the short public ID shown next to the nickname
 // Every message is signed with the private key and carries the public key, so
 // receivers can check that the sender really holds the secret behind that ID.
-const SALT = TOPIC + "|identity-v1|";
+const SALT = "jnvanderz.github.io/mqttchat|identity-v1|";
 const MAX_NICK = 24, MAX_TEXT = 500;
 const enc = new TextEncoder();
 const PKCS8_ED25519_PREFIX = Uint8Array.from(
