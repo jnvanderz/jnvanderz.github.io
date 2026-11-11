@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mqttchat</title>
 <style>
+  /* Chat text: the Tomo pixel font when it is installed on the device, otherwise
+     DejaVu Sans Mono Bold (free licence) loaded from a CDN. */
   @font-face {
     font-family: "Chat Mono"; font-display: swap;
     src: local("Tomo"),
@@ -90,7 +92,7 @@
   .titlebar {
     display: flex; align-items: center; justify-content: space-between;
     padding: 2px 2px 2px 5px; color: #fff; font-weight: bold;
-    background: linear-gradient(90deg, #ff00ff, #00ffff);
+    background: #000080;
   }
   .titlebar button { padding: 0; width: 16px; height: 14px; line-height: 10px; font-size: 11px; font-weight: bold; color: #000; }
   .titlebar button:active:not(:disabled) { padding: 1px 0 0 1px; }
