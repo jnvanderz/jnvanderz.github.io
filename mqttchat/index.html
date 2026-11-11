@@ -55,10 +55,6 @@
     font: 12px/1.2 Tahoma, "MS Sans Serif", Verdana, Arial, sans-serif;
   }
   .bar { display: flex; gap: 4px; padding: 4px; }
-  #settings { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 6px; align-items: center; border-bottom: 1px solid var(--lo); }
-  #settings[hidden] { display: none; }
-  #settings label { display: flex; align-items: center; gap: 4px; }
-  .me b { font-family: "Lucida Console", Menlo, Consolas, monospace; }
 
   input, button { font: inherit; color: inherit; }
   input[type=text], input[type=password] {
@@ -96,12 +92,8 @@
   </div>
 
   <div class="chrome">
-    <div id="settings" hidden>
-      <label>Nickname <input id="nick" type="text" maxlength="24" size="18" autocomplete="off" placeholder="anonymous"></label>
-      <span class="me">Your ID: <b id="myid">…</b></span>
-    </div>
     <form class="bar" id="form">
-      <button id="nickbtn" type="button" title="Change nickname" aria-expanded="false" aria-controls="settings">anonymous</button>
+      <button id="nickbtn" type="button" title="Change nickname">anonymous</button>
       <input id="text" type="text" maxlength="500" autocomplete="off" aria-label="Message">
       <button id="sendbtn" disabled>Send</button>
     </form>
@@ -182,6 +174,7 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
 };
 
+let nickname = "";   // empty means "anonymous"
 let keys = null;       // current derived keypair
 let client = null;
 let connected = false;
@@ -243,7 +236,7 @@ function refreshSend() {
   $("sendbtn").disabled = !(connected && keys);
 }
 function refreshNick() {
-  $("nickbtn").textContent = $("nick").value.trim() || "anonymous";
+  $("nickbtn").textContent = nickname || "anonymous";
 }
 
 // The secret identity is generated on the first visit and kept in this browser's
@@ -255,8 +248,7 @@ async function loadIdentity() {
     store.set("mqttchat.identity", identity);
   }
   keys = await deriveKeys(identity);
-  $("myid").textContent = keys.id;
-  $("myid").style.color = "#000";
+  $("nickbtn").title = "Change nickname (your ID: " + keys.id + ")";
   refreshSend();
 }
 
@@ -303,7 +295,7 @@ $("form").addEventListener("submit", async e => {
   e.preventDefault();
   const text = $("text").value.trim();
   if (!text || !keys || !connected) return;
-  const nick = ($("nick").value.trim() || "anonymous").slice(0, MAX_NICK);
+  const nick = nickname || "anonymous";
   $("text").value = "";
   const payload = await signMessage(keys, nick, text.slice(0, MAX_TEXT));
   // retain: the broker keeps this as the last message and shows it to newcomers.
@@ -312,16 +304,16 @@ $("form").addEventListener("submit", async e => {
 });
 
 $("nickbtn").addEventListener("click", () => {
-  const open = $("settings").hidden;
-  $("settings").hidden = !open;
-  $("nickbtn").setAttribute("aria-expanded", String(open));
-  if (open) $("nick").focus(); else $("text").focus();
+  const answer = prompt("Enter your new nickname:", nickname);
+  if (answer === null) return; // cancelled
+  nickname = answer.trim().slice(0, MAX_NICK);
+  store.set("mqttchat.nick", nickname);
+  refreshNick();
+  $("text").focus();
 });
-$("nick").addEventListener("input", () => { store.set("mqttchat.nick", $("nick").value); refreshNick(); });
-$("nick").addEventListener("keydown", e => { if (e.key === "Enter") $("nickbtn").click(); });
 
 (async function init() {
-  $("nick").value = store.get("mqttchat.nick") || "";
+  nickname = (store.get("mqttchat.nick") || "").trim().slice(0, MAX_NICK);
   refreshNick();
   try {
     await loadIdentity();
@@ -333,7 +325,6 @@ $("nick").addEventListener("keydown", e => { if (e.key === "Enter") $("nickbtn")
     note("could not load the MQTT library from unpkg.com.", true);
     return;
   }
-  if (!store.get("mqttchat.nick")) $("nickbtn").click();
   connect();
 })();
 </script>
