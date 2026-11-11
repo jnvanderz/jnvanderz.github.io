@@ -1,1 +1,317 @@
-a
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mqttchat</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --text: #1d1d1b; --muted: #6f6e69;
+    --line: #dddbd3; --accent: #1f6f5c; --accent-text: #ffffff; --warn: #a4471c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161715; --panel: #1f201e; --text: #ecebe6; --muted: #9b9a94;
+      --line: #33342f; --accent: #4fb79d; --accent-text: #10201c; --warn: #e08a5b;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; justify-content: center;
+  }
+  .app { width: 100%; max-width: 760px; height: 100%; display: flex; flex-direction: column; padding: 12px; gap: 10px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+  h1 small { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 6px; }
+  #status { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  #status::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); margin-right: 6px; }
+  #status.on::before { background: var(--accent); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .who { padding: 10px 12px; display: grid; grid-template-columns: 1fr 1.6fr; gap: 10px; }
+  @media (max-width: 560px) { .who { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 4px; }
+  input, button { font: inherit; color: inherit; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 8px 10px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 7px; min-width: 0;
+  }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .row { display: flex; gap: 6px; }
+  button {
+    padding: 8px 12px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--bg); cursor: pointer; white-space: nowrap;
+  }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .me { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+  .tag { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+
+  #log { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 0; }
+  .msg { padding: 6px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+  .msg:last-child { border-bottom: 0; }
+  .meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+  .nick { font-weight: 600; }
+  .time { font-size: 11px; color: var(--muted); margin-left: auto; }
+  .body { white-space: pre-wrap; }
+  .empty, .note { color: var(--muted); font-size: 13px; padding: 14px 0; text-align: center; }
+  .note.err { color: var(--warn); }
+
+  form.send { display: flex; gap: 6px; padding: 8px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>mqttchat <small>jnvanderz.github.io/mqttchat</small></h1>
+    <span id="status">connecting…</span>
+  </header>
+
+  <section class="panel who">
+    <div>
+      <label for="nick">Nickname</label>
+      <input id="nick" type="text" maxlength="24" autocomplete="off" placeholder="anonymous">
+    </div>
+    <div>
+      <label for="identity">Identity (secret, keep it to yourself)</label>
+      <div class="row">
+        <input id="identity" type="password" maxlength="200" autocomplete="off" spellcheck="false">
+        <button id="show" type="button">Show</button>
+        <button id="regen" type="button" title="Generate a new random identity">New</button>
+      </div>
+    </div>
+    <div class="me">Others see you as <span id="myid" class="tag">…</span></div>
+  </section>
+
+  <section id="log" class="panel" aria-live="polite">
+    <div class="empty" id="empty">No messages yet. Say something.</div>
+  </section>
+
+  <form class="panel send" id="form">
+    <input id="text" type="text" maxlength="500" autocomplete="off" placeholder="Type a message…">
+    <button class="primary" id="sendbtn" disabled>Send</button>
+  </form>
+</div>
+
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<script>
+"use strict";
+
+const TOPIC  = "jnvanderz.github.io/mqttchat";
+const BROKER = "wss://test.mosquitto.org:8081";
+
+// CRYPTO-BEGIN
+// How identity works:
+//   secret identity --SHA-256 with fixed salt--> Ed25519 private key --> public key
+//   public key --SHA-256 with fixed salt--> the short public ID shown next to the nickname
+// Every message is signed with the private key and carries the public key, so
+// receivers can check that the sender really holds the secret behind that ID.
+const SALT = TOPIC + "|identity-v1|";
+const MAX_NICK = 24, MAX_TEXT = 500;
+const enc = new TextEncoder();
+const PKCS8_ED25519_PREFIX = Uint8Array.from(
+  [0x30,0x2e,0x02,0x01,0x00,0x30,0x05,0x06,0x03,0x2b,0x65,0x70,0x04,0x22,0x04,0x20]);
+
+const b64 = bytes => btoa(String.fromCharCode(...bytes))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64 = s => Uint8Array.from(
+  atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+const sha256 = async bytes => new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+
+async function publicId(pubB64) {
+  return b64((await sha256(enc.encode(SALT + pubB64))).slice(0, 12));
+}
+
+async function deriveKeys(identity) {
+  const seed = await sha256(enc.encode(SALT + identity));
+  const pkcs8 = new Uint8Array(48);
+  pkcs8.set(PKCS8_ED25519_PREFIX);
+  pkcs8.set(seed, 16);
+  const priv = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, true, ["sign"]);
+  const pub = (await crypto.subtle.exportKey("jwk", priv)).x;
+  return { priv, pub, id: await publicId(pub) };
+}
+
+const signedBytes = (n, t, m) => enc.encode(JSON.stringify([TOPIC, n, t, m]));
+
+async function signMessage(keys, n, m) {
+  const t = Date.now();
+  const sig = await crypto.subtle.sign({ name: "Ed25519" }, keys.priv, signedBytes(n, t, m));
+  return JSON.stringify({ n, k: keys.pub, t, m, s: b64(new Uint8Array(sig)) });
+}
+
+// Returns {n, t, m, s, id} if the payload is well formed and the signature is valid, else null.
+async function verifyMessage(raw) {
+  try {
+    if (raw.length > 2000) return null;
+    const { n, k, t, m, s } = JSON.parse(raw);
+    if (typeof n !== "string" || typeof m !== "string" || typeof k !== "string" ||
+        typeof s !== "string" || !Number.isSafeInteger(t)) return null;
+    if (!n || n.length > MAX_NICK || !m || m.length > MAX_TEXT) return null;
+    const key = await crypto.subtle.importKey("raw", unb64(k), { name: "Ed25519" }, false, ["verify"]);
+    const ok = await crypto.subtle.verify({ name: "Ed25519" }, key, unb64(s), signedBytes(n, t, m));
+    return ok ? { n, t, m, s, id: await publicId(k) } : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function randomIdentity() {
+  return b64(crypto.getRandomValues(new Uint8Array(24)));
+}
+// CRYPTO-END
+
+const $ = id => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+let keys = null;       // current derived keypair
+let client = null;
+let connected = false;
+const seen = new Set(); // signatures already shown
+
+function note(text, isError) {
+  const d = document.createElement("div");
+  d.className = "note" + (isError ? " err" : "");
+  d.textContent = text;
+  $("log").appendChild(d);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function hue(id) {
+  let h = 0;
+  for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return h;
+}
+
+// All remote content goes in through textContent, never innerHTML.
+function showMessage(msg) {
+  const log = $("log");
+  const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  $("empty")?.remove();
+
+  const row = document.createElement("div"); row.className = "msg";
+  const meta = document.createElement("div"); meta.className = "meta";
+  const nick = document.createElement("span"); nick.className = "nick"; nick.textContent = msg.n;
+  const id = document.createElement("span"); id.className = "tag"; id.textContent = msg.id;
+  id.style.color = `hsl(${hue(msg.id)} 55% 50%)`;
+  id.title = "Public ID, derived from the sender's secret identity";
+  const time = document.createElement("span"); time.className = "time";
+  const d = new Date(msg.t);
+  time.textContent = d.toLocaleDateString() === new Date().toLocaleDateString()
+    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleString([], { dateStyle: "short", timeStyle: "short" });
+  const body = document.createElement("div"); body.className = "body"; body.textContent = msg.m;
+
+  meta.append(nick, id, time);
+  row.append(meta, body);
+  log.appendChild(row);
+  while (log.children.length > 300) log.firstChild.remove();
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+
+function refreshSend() {
+  $("sendbtn").disabled = !(connected && keys);
+}
+
+async function applyIdentity() {
+  const identity = $("identity").value;
+  store.set("mqttchat.identity", identity);
+  keys = null; refreshSend();
+  $("myid").textContent = "…";
+  if (!identity) { $("myid").textContent = "(enter an identity)"; return; }
+  const k = await deriveKeys(identity);
+  if ($("identity").value !== identity) return; // changed while we were deriving
+  keys = k;
+  $("myid").textContent = k.id;
+  $("myid").style.color = `hsl(${hue(k.id)} 55% 50%)`;
+  refreshSend();
+}
+
+// Incoming messages are verified one at a time so they stay in order.
+let queue = Promise.resolve();
+function onMessage(topic, payload, packet) {
+  if (topic !== TOPIC) return;
+  const raw = payload.toString();
+  queue = queue.then(async () => {
+    const msg = await verifyMessage(raw);
+    if (!msg || seen.has(msg.s)) return;
+    // Drop live messages with a timestamp far from now: they are replays of old ones.
+    // The retained message is allowed to be old; its signed time is displayed.
+    if (!packet.retain && Math.abs(Date.now() - msg.t) > 10 * 60 * 1000) return;
+    seen.add(msg.s);
+    showMessage(msg);
+  });
+}
+
+function connect() {
+  client = mqtt.connect(BROKER, {
+    clientId: "mqttchat_" + Math.random().toString(16).slice(2, 10),
+    reconnectPeriod: 3000,
+    connectTimeout: 15000,
+  });
+  client.on("connect", () => {
+    connected = true;
+    $("status").textContent = "connected"; $("status").className = "on";
+    client.subscribe(TOPIC);
+    refreshSend();
+  });
+  const down = text => () => {
+    connected = false;
+    $("status").textContent = text; $("status").className = "";
+    refreshSend();
+  };
+  client.on("reconnect", down("reconnecting…"));
+  client.on("close", down("disconnected"));
+  client.on("error", down("connection error"));
+  client.on("message", onMessage);
+}
+
+$("form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const text = $("text").value.trim();
+  if (!text || !keys || !connected) return;
+  const nick = ($("nick").value.trim() || "anonymous").slice(0, MAX_NICK);
+  $("text").value = "";
+  const payload = await signMessage(keys, nick, text.slice(0, MAX_TEXT));
+  // retain: the broker keeps this as the last message and shows it to newcomers.
+  client.publish(TOPIC, payload, { qos: 1, retain: true });
+  $("text").focus();
+});
+
+$("nick").addEventListener("input", () => store.set("mqttchat.nick", $("nick").value));
+$("identity").addEventListener("input", applyIdentity);
+$("show").addEventListener("click", () => {
+  const hidden = $("identity").type === "password";
+  $("identity").type = hidden ? "text" : "password";
+  $("show").textContent = hidden ? "Hide" : "Show";
+});
+$("regen").addEventListener("click", () => {
+  if (!confirm("Replace your identity with a new random one? Your current public ID is lost unless you saved the old identity.")) return;
+  $("identity").value = randomIdentity();
+  applyIdentity();
+});
+
+(async function init() {
+  $("nick").value = store.get("mqttchat.nick") || "";
+  $("identity").value = store.get("mqttchat.identity") || randomIdentity();
+  try {
+    await applyIdentity();
+  } catch (e) {
+    note("This browser does not support Ed25519 in Web Crypto, so messages cannot be signed. Try a current version of Chrome, Firefox, Edge or Safari.", true);
+    return;
+  }
+  if (typeof mqtt === "undefined") {
+    note("Could not load the MQTT library from unpkg.com.", true);
+    return;
+  }
+  connect();
+})();
+</script>
+</body>
+</html>
