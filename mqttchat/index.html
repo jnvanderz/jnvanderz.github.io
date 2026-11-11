@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en"> 
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -58,9 +58,6 @@
   #settings { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 6px; align-items: center; border-bottom: 1px solid var(--lo); }
   #settings[hidden] { display: none; }
   #settings label { display: flex; align-items: center; gap: 4px; }
-  #settings .grow { flex: 1; min-width: 220px; }
-  #settings .grow input { flex: 1; min-width: 0; }
-  .me { flex-basis: 100%; }
   .me b { font-family: "Lucida Console", Menlo, Consolas, monospace; }
 
   input, button { font: inherit; color: inherit; }
@@ -101,15 +98,10 @@
   <div class="chrome">
     <div id="settings" hidden>
       <label>Nickname <input id="nick" type="text" maxlength="24" size="18" autocomplete="off" placeholder="anonymous"></label>
-      <label class="grow">Identity (secret)
-        <input id="identity" type="password" maxlength="200" autocomplete="off" spellcheck="false">
-        <button id="show" type="button">Show</button>
-        <button id="regen" type="button" title="Generate a new random identity">New</button>
-      </label>
-      <div class="me">Others see you as <b id="myid">…</b></div>
+      <span class="me">Your ID: <b id="myid">…</b></span>
     </div>
     <form class="bar" id="form">
-      <button id="nickbtn" type="button" title="Change nickname and identity" aria-expanded="false" aria-controls="settings">anonymous</button>
+      <button id="nickbtn" type="button" title="Change nickname" aria-expanded="false" aria-controls="settings">anonymous</button>
       <input id="text" type="text" maxlength="500" autocomplete="off" aria-label="Message">
       <button id="sendbtn" disabled>Send</button>
     </form>
@@ -254,16 +246,17 @@ function refreshNick() {
   $("nickbtn").textContent = $("nick").value.trim() || "anonymous";
 }
 
-async function applyIdentity() {
-  const identity = $("identity").value;
-  store.set("mqttchat.identity", identity);
-  keys = null; refreshSend();
-  $("myid").textContent = "…";
-  if (!identity) { $("myid").textContent = "(enter an identity)"; return; }
-  const k = await deriveKeys(identity);
-  if ($("identity").value !== identity) return; // changed while we were deriving
-  keys = k;
-  $("myid").textContent = k.id;
+// The secret identity is generated on the first visit and kept in this browser's
+// localStorage, so the same public ID comes back on every later visit.
+async function loadIdentity() {
+  let identity = store.get("mqttchat.identity");
+  if (!identity) {
+    identity = randomIdentity();
+    store.set("mqttchat.identity", identity);
+  }
+  keys = await deriveKeys(identity);
+  $("myid").textContent = keys.id;
+  $("myid").style.color = "#000";
   refreshSend();
 }
 
@@ -326,24 +319,12 @@ $("nickbtn").addEventListener("click", () => {
 });
 $("nick").addEventListener("input", () => { store.set("mqttchat.nick", $("nick").value); refreshNick(); });
 $("nick").addEventListener("keydown", e => { if (e.key === "Enter") $("nickbtn").click(); });
-$("identity").addEventListener("input", applyIdentity);
-$("show").addEventListener("click", () => {
-  const hidden = $("identity").type === "password";
-  $("identity").type = hidden ? "text" : "password";
-  $("show").textContent = hidden ? "Hide" : "Show";
-});
-$("regen").addEventListener("click", () => {
-  if (!confirm("Replace your identity with a new random one? Your current public ID is lost unless you saved the old identity.")) return;
-  $("identity").value = randomIdentity();
-  applyIdentity();
-});
 
 (async function init() {
   $("nick").value = store.get("mqttchat.nick") || "";
   refreshNick();
-  $("identity").value = store.get("mqttchat.identity") || randomIdentity();
   try {
-    await applyIdentity();
+    await loadIdentity();
   } catch (e) {
     note("this browser does not support Ed25519 in Web Crypto, so messages cannot be signed. try a current version of Chrome, Firefox, Edge or Safari.", true);
     return;
