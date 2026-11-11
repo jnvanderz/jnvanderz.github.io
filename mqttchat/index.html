@@ -6,94 +6,114 @@
 <title>mqttchat</title>
 <style>
   :root {
-    --bg: #f6f5f1; --panel: #ffffff; --text: #1d1d1b; --muted: #6f6e69;
-    --line: #dddbd3; --accent: #1f6f5c; --accent-text: #ffffff; --warn: #a4471c;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #161715; --panel: #1f201e; --text: #ecebe6; --muted: #9b9a94;
-      --line: #33342f; --accent: #4fb79d; --accent-text: #10201c; --warn: #e08a5b;
-    }
+    --bg: #000; --text: #e6e6e6; --dim: #7a7a7a; --line: #2a2a2a;
+    --chrome: #c0c0c0; --chrome-text: #000; --hi: #fff; --lo: #808080; --dark: #000;
+    --warn: #ff6b5b; --ok: #5fdc7a;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--bg); color: var(--text);
-    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display: flex; justify-content: center;
+    font: 13px/1.35 "Lucida Console", "DejaVu Sans Mono", Menlo, Consolas, monospace;
   }
-  .app { width: 100%; max-width: 760px; height: 100%; display: flex; flex-direction: column; padding: 12px; gap: 10px; }
-  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-  h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
-  h1 small { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 6px; }
-  #status { font-size: 12px; color: var(--muted); white-space: nowrap; }
-  #status::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); margin-right: 6px; }
-  #status.on::before { background: var(--accent); }
+  .app { height: 100%; display: flex; flex-direction: column; }
+  .main { flex: 1; display: flex; min-height: 0; }
 
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
-  .who { padding: 10px 12px; display: grid; grid-template-columns: 1fr 1.6fr; gap: 10px; }
-  @media (max-width: 560px) { .who { grid-template-columns: 1fr; } }
-  label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 4px; }
+  #log { flex: 1; overflow-y: auto; padding: 6px 8px; min-width: 0; }
+  .msg { display: flex; gap: 8px; padding: 1px 0; align-items: baseline; }
+  .msg:hover { background: #111; }
+  .time { color: var(--dim); flex: none; }
+  .who { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nick { font-weight: bold; }
+  .tag { color: var(--dim); font-size: 11px; margin-left: 4px; }
+  .body { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .note { color: var(--dim); padding: 1px 0; }
+  .note::before { content: "~ "; }
+  .note.err { color: var(--warn); }
+  @media (max-width: 560px) {
+    .msg { flex-wrap: wrap; gap: 0 8px; }
+    .who { max-width: none; }
+    .body { flex-basis: 100%; padding-left: 12px; }
+  }
+
+  #users {
+    width: 190px; flex: none; border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  @media (max-width: 700px) { #users { display: none; } }
+  .uhead { color: var(--dim); padding: 6px 8px 4px; border-bottom: 1px solid var(--line); }
+  #ulist { flex: 1; overflow-y: auto; padding: 4px 8px; }
+  .user { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 1px 0; }
+  #status { padding: 4px 8px; border-top: 1px solid var(--line); color: var(--warn); }
+  #status.on { color: var(--ok); }
+  #status::before { content: "\25CF  "; }
+
+  /* Grey beveled bar and controls */
+  .chrome {
+    background: var(--chrome); color: var(--chrome-text);
+    border-top: 2px solid var(--hi);
+    font: 12px/1.2 Tahoma, "MS Sans Serif", Verdana, Arial, sans-serif;
+  }
+  .bar { display: flex; gap: 4px; padding: 4px; }
+  #settings { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 6px; align-items: center; border-bottom: 1px solid var(--lo); }
+  #settings[hidden] { display: none; }
+  #settings label { display: flex; align-items: center; gap: 4px; }
+  #settings .grow { flex: 1; min-width: 220px; }
+  #settings .grow input { flex: 1; min-width: 0; }
+  .me { flex-basis: 100%; }
+  .me b { font-family: "Lucida Console", Menlo, Consolas, monospace; }
+
   input, button { font: inherit; color: inherit; }
   input[type=text], input[type=password] {
-    width: 100%; padding: 8px 10px; background: var(--bg);
-    border: 1px solid var(--line); border-radius: 7px; min-width: 0;
+    background: #fff; color: #000; padding: 3px 4px; border: 2px solid;
+    border-color: var(--lo) var(--hi) var(--hi) var(--lo);
+    box-shadow: inset 1px 1px 0 var(--dark); border-radius: 0; min-width: 0;
   }
-  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .row { display: flex; gap: 6px; }
+  #text { flex: 1; font-family: "Lucida Console", Menlo, Consolas, monospace; }
   button {
-    padding: 8px 12px; border-radius: 7px; border: 1px solid var(--line);
-    background: var(--bg); cursor: pointer; white-space: nowrap;
+    background: var(--chrome); padding: 3px 10px; border: 2px solid; border-radius: 0;
+    border-color: var(--hi) var(--dark) var(--dark) var(--hi);
+    box-shadow: inset -1px -1px 0 var(--lo); cursor: pointer; white-space: nowrap;
   }
-  button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
-  button:disabled { opacity: 0.5; cursor: default; }
-  .me { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
-  .tag { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-
-  #log { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 0; }
-  .msg { padding: 6px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
-  .msg:last-child { border-bottom: 0; }
-  .meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
-  .nick { font-weight: 600; }
-  .time { font-size: 11px; color: var(--muted); margin-left: auto; }
-  .body { white-space: pre-wrap; }
-  .empty, .note { color: var(--muted); font-size: 13px; padding: 14px 0; text-align: center; }
-  .note.err { color: var(--warn); }
-
-  form.send { display: flex; gap: 6px; padding: 8px; }
+  button:active:not(:disabled) {
+    border-color: var(--dark) var(--hi) var(--hi) var(--dark);
+    box-shadow: inset 1px 1px 0 var(--lo); padding: 4px 9px 2px 11px;
+  }
+  button:disabled { color: var(--lo); text-shadow: 1px 1px 0 var(--hi); cursor: default; }
+  input:focus-visible { outline: 1px dotted #000; outline-offset: -4px; }
+  button:focus-visible { outline: 1px dotted #000; outline-offset: -5px; }
+  #nickbtn { max-width: 30%; overflow: hidden; text-overflow: ellipsis; font-weight: bold; }
 </style>
 </head>
 <body>
 <div class="app">
-  <header>
-    <h1>mqttchat <small>jnvanderz.github.io/mqttchat</small></h1>
-    <span id="status">connecting…</span>
-  </header>
-
-  <section class="panel who">
-    <div>
-      <label for="nick">Nickname</label>
-      <input id="nick" type="text" maxlength="24" autocomplete="off" placeholder="anonymous">
+  <div class="main">
+    <div id="log" aria-live="polite">
+      <div class="note" id="empty">no messages yet on jnvanderz.github.io/mqttchat. say something.</div>
     </div>
-    <div>
-      <label for="identity">Identity (secret, keep it to yourself)</label>
-      <div class="row">
+    <aside id="users">
+      <div class="uhead">seen here</div>
+      <div id="ulist"></div>
+      <div id="status">connecting…</div>
+    </aside>
+  </div>
+
+  <div class="chrome">
+    <div id="settings" hidden>
+      <label>Nickname <input id="nick" type="text" maxlength="24" size="18" autocomplete="off" placeholder="anonymous"></label>
+      <label class="grow">Identity (secret)
         <input id="identity" type="password" maxlength="200" autocomplete="off" spellcheck="false">
         <button id="show" type="button">Show</button>
         <button id="regen" type="button" title="Generate a new random identity">New</button>
-      </div>
+      </label>
+      <div class="me">Others see you as <b id="myid">…</b></div>
     </div>
-    <div class="me">Others see you as <span id="myid" class="tag">…</span></div>
-  </section>
-
-  <section id="log" class="panel" aria-live="polite">
-    <div class="empty" id="empty">No messages yet. Say something.</div>
-  </section>
-
-  <form class="panel send" id="form">
-    <input id="text" type="text" maxlength="500" autocomplete="off" placeholder="Type a message…">
-    <button class="primary" id="sendbtn" disabled>Send</button>
-  </form>
+    <form class="bar" id="form">
+      <button id="nickbtn" type="button" title="Change nickname and identity" aria-expanded="false" aria-controls="settings">anonymous</button>
+      <input id="text" type="text" maxlength="500" autocomplete="off" aria-label="Message">
+      <button id="sendbtn" disabled>Send</button>
+    </form>
+  </div>
 </div>
 
 <script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
@@ -174,6 +194,15 @@ let keys = null;       // current derived keypair
 let client = null;
 let connected = false;
 const seen = new Set(); // signatures already shown
+const users = new Map(); // public ID -> row in the "seen here" list
+
+function hue(id) {
+  let h = 0;
+  for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return h;
+}
+const colorOf = id => `hsl(${hue(id)} 90% 65%)`;
+const pad = n => String(n).padStart(2, "0");
 
 function note(text, isError) {
   const d = document.createElement("div");
@@ -183,40 +212,46 @@ function note(text, isError) {
   $("log").scrollTop = $("log").scrollHeight;
 }
 
-function hue(id) {
-  let h = 0;
-  for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
-  return h;
-}
-
 // All remote content goes in through textContent, never innerHTML.
 function showMessage(msg) {
   const log = $("log");
   const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
   $("empty")?.remove();
 
-  const row = document.createElement("div"); row.className = "msg";
-  const meta = document.createElement("div"); meta.className = "meta";
-  const nick = document.createElement("span"); nick.className = "nick"; nick.textContent = msg.n;
-  const id = document.createElement("span"); id.className = "tag"; id.textContent = msg.id;
-  id.style.color = `hsl(${hue(msg.id)} 55% 50%)`;
-  id.title = "Public ID, derived from the sender's secret identity";
-  const time = document.createElement("span"); time.className = "time";
   const d = new Date(msg.t);
-  time.textContent = d.toLocaleDateString() === new Date().toLocaleDateString()
-    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : d.toLocaleString([], { dateStyle: "short", timeStyle: "short" });
-  const body = document.createElement("div"); body.className = "body"; body.textContent = msg.m;
+  const row = document.createElement("div"); row.className = "msg";
+  const time = document.createElement("span"); time.className = "time";
+  time.textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  time.title = d.toLocaleString();
+  const who = document.createElement("span"); who.className = "who";
+  const nick = document.createElement("span"); nick.className = "nick";
+  nick.textContent = msg.n; nick.style.color = colorOf(msg.id);
+  const id = document.createElement("span"); id.className = "tag"; id.textContent = msg.id;
+  id.title = "Public ID, derived from the sender's secret identity";
+  who.append(nick, id);
+  const body = document.createElement("span"); body.className = "body"; body.textContent = msg.m;
 
-  meta.append(nick, id, time);
-  row.append(meta, body);
+  row.append(time, who, body);
   log.appendChild(row);
   while (log.children.length > 300) log.firstChild.remove();
   if (stick) log.scrollTop = log.scrollHeight;
+
+  let u = users.get(msg.id);
+  if (!u) {
+    u = document.createElement("div"); u.className = "user";
+    u.style.color = colorOf(msg.id);
+    users.set(msg.id, u);
+    $("ulist").appendChild(u);
+  }
+  u.textContent = msg.n;
+  u.title = msg.id;
 }
 
 function refreshSend() {
   $("sendbtn").disabled = !(connected && keys);
+}
+function refreshNick() {
+  $("nickbtn").textContent = $("nick").value.trim() || "anonymous";
 }
 
 async function applyIdentity() {
@@ -229,7 +264,6 @@ async function applyIdentity() {
   if ($("identity").value !== identity) return; // changed while we were deriving
   keys = k;
   $("myid").textContent = k.id;
-  $("myid").style.color = `hsl(${hue(k.id)} 55% 50%)`;
   refreshSend();
 }
 
@@ -284,7 +318,14 @@ $("form").addEventListener("submit", async e => {
   $("text").focus();
 });
 
-$("nick").addEventListener("input", () => store.set("mqttchat.nick", $("nick").value));
+$("nickbtn").addEventListener("click", () => {
+  const open = $("settings").hidden;
+  $("settings").hidden = !open;
+  $("nickbtn").setAttribute("aria-expanded", String(open));
+  if (open) $("nick").focus(); else $("text").focus();
+});
+$("nick").addEventListener("input", () => { store.set("mqttchat.nick", $("nick").value); refreshNick(); });
+$("nick").addEventListener("keydown", e => { if (e.key === "Enter") $("nickbtn").click(); });
 $("identity").addEventListener("input", applyIdentity);
 $("show").addEventListener("click", () => {
   const hidden = $("identity").type === "password";
@@ -299,17 +340,19 @@ $("regen").addEventListener("click", () => {
 
 (async function init() {
   $("nick").value = store.get("mqttchat.nick") || "";
+  refreshNick();
   $("identity").value = store.get("mqttchat.identity") || randomIdentity();
   try {
     await applyIdentity();
   } catch (e) {
-    note("This browser does not support Ed25519 in Web Crypto, so messages cannot be signed. Try a current version of Chrome, Firefox, Edge or Safari.", true);
+    note("this browser does not support Ed25519 in Web Crypto, so messages cannot be signed. try a current version of Chrome, Firefox, Edge or Safari.", true);
     return;
   }
   if (typeof mqtt === "undefined") {
-    note("Could not load the MQTT library from unpkg.com.", true);
+    note("could not load the MQTT library from unpkg.com.", true);
     return;
   }
+  if (!store.get("mqttchat.nick")) $("nickbtn").click();
   connect();
 })();
 </script>
