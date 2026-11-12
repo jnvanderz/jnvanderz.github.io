@@ -3,9 +3,9 @@
 <title>ghv</title>
 <script>
 // Usage:
-//   ghv.html?/path/file.html                      (user jnvanderz, repo jnvanderz, branch main)
-//   ghv.html?repo/path/file.html                  (user jnvanderz, branch main)
-//   ghv.html?user/repo@branch/path/file.html      (explicit)
+//   g?/path/file.html                      (user jnvanderz, repo jnvanderz, branch main)
+//   g?repo/path/file.html                  (user jnvanderz, branch main)
+//   g?user/repo@branch/path/file.html      (explicit)
 const DEFAULT_USER = "jnvanderz";
 const DEFAULT_BRANCH = "main";
 (async () => {
@@ -15,8 +15,6 @@ const DEFAULT_BRANCH = "main";
   if (!path) return fail(usage);
   let target = decodeURIComponent(path);
   if (!target.includes("@")) {
-    // Short form: first segment is the repo, the rest is the file path.
-    // A leading "/" means the repo has the same name as the user.
     const slash = target.indexOf("/");
     if (slash < 0) return fail(usage);
     const repo = slash === 0 ? DEFAULT_USER : target.slice(0, slash);
