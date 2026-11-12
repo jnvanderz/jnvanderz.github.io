@@ -1,19 +1,26 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
-<title>view</title>
+<title>ghv</title>
 <script>
+// Usage:
+//   ghv.html?/path/file.html                      (user jnvanderz, repo jnvanderz, branch main)
+//   ghv.html?repo/path/file.html                  (user jnvanderz, branch main)
+//   ghv.html?user/repo@branch/path/file.html      (explicit)
 const DEFAULT_USER = "jnvanderz";
 const DEFAULT_BRANCH = "main";
 (async () => {
   const path = location.search.slice(1);
   const fail = (msg) => { document.documentElement.textContent = msg; };
-  const usage = "Usage: ?repo/path/file.html  or  ?user/repo@branch/path/file.html";
+  const usage = "Usage: ?/path/file.html  or  ?repo/path/file.html  or  ?user/repo@branch/path/file.html";
   if (!path) return fail(usage);
   let target = decodeURIComponent(path);
   if (!target.includes("@")) {
+    // Short form: first segment is the repo, the rest is the file path.
+    // A leading "/" means the repo has the same name as the user.
     const slash = target.indexOf("/");
-    if (slash < 1) return fail(usage);
-    target = DEFAULT_USER + "/" + target.slice(0, slash) + "@" + DEFAULT_BRANCH + target.slice(slash);
+    if (slash < 0) return fail(usage);
+    const repo = slash === 0 ? DEFAULT_USER : target.slice(0, slash);
+    target = DEFAULT_USER + "/" + repo + "@" + DEFAULT_BRANCH + target.slice(slash);
   }
   const url = encodeURI("https://cdn.jsdelivr.net/gh/" + target);
   const res = await fetch(url);
