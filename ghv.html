@@ -2,11 +2,20 @@
 <meta charset="utf-8">
 <title>view</title>
 <script>
+const DEFAULT_USER = "jnvanderz";
+const DEFAULT_BRANCH = "main";
 (async () => {
   const path = location.search.slice(1);
   const fail = (msg) => { document.documentElement.textContent = msg; };
-  if (!path) return fail("Usage: ?user/repo@branch/path/file.html");
-  const url = encodeURI("https://cdn.jsdelivr.net/gh/" + decodeURIComponent(path));
+  const usage = "Usage: ?repo/path/file.html  or  ?user/repo@branch/path/file.html";
+  if (!path) return fail(usage);
+  let target = decodeURIComponent(path);
+  if (!target.includes("@")) {
+    const slash = target.indexOf("/");
+    if (slash < 1) return fail(usage);
+    target = DEFAULT_USER + "/" + target.slice(0, slash) + "@" + DEFAULT_BRANCH + target.slice(slash);
+  }
+  const url = encodeURI("https://cdn.jsdelivr.net/gh/" + target);
   const res = await fetch(url);
   if (!res.ok) return fail("Could not load " + url + " (HTTP " + res.status + ")");
   let html = await res.text();
