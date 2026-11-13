@@ -4,6 +4,7 @@
 <script>
 const DEFAULT_USER = "jnvanderz";
 const DEFAULT_BRANCH = "main";
+const RAW = "https://raw.githubusercontent.com/";
 (async () => {
   const path = location.search.slice(1);
   const fail = (msg) => { document.documentElement.textContent = msg; };
@@ -16,14 +17,37 @@ const DEFAULT_BRANCH = "main";
     const repo = slash === 0 ? DEFAULT_USER : target.slice(0, slash);
     target = DEFAULT_USER + "/" + repo + "@" + DEFAULT_BRANCH + target.slice(slash);
   }
-  const url = encodeURI("https://cdn.jsdelivr.net/gh/" + target);
-  const res = await fetch(url);
+  const m = target.match(/^([^/]+)\/([^@/]+)@([^/]+)\/(.+)$/);
+  if (!m) return fail(usage);
+  const url = encodeURI(RAW + m[1] + "/" + m[2] + "/" + m[3] + "/" + m[4]);
+  const baseUrl = url.slice(0, url.lastIndexOf("/") + 1);
+  const get = (u) => fetch(u + (u.includes("?") ? "&" : "?") + "t=" + Date.now(), { cache: "no-store" });
+  const res = await get(url);
   if (!res.ok) return fail("Could not load " + url + " (HTTP " + res.status + ")");
-  let html = await res.text();
-  const base = '<base href="' + url.slice(0, url.lastIndexOf("/") + 1) + '">';
-  html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + base) : base + html;
+  const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+
+  const els = [...doc.querySelectorAll('script[src], link[rel~="stylesheet"][href]')];
+  await Promise.all(els.map(async (el) => {
+    const isLink = el.tagName === "LINK";
+    const abs = new URL(el.getAttribute(isLink ? "href" : "src"), baseUrl).href;
+    if (!abs.startsWith(RAW)) return;
+    const r = await get(abs);
+    if (!r.ok) return;
+    const code = await r.text();
+    if (isLink) {
+      const style = doc.createElement("style");
+      style.textContent = code;
+      el.replaceWith(style);
+    } else {
+      el.removeAttribute("src");
+      el.textContent = code.replace(/<\/script/gi, "<\\/script");
+    }
+  }));
+  const base = doc.createElement("base");
+  base.href = baseUrl;
+  doc.head.prepend(base);
   document.open();
-  document.write(html);
+  document.write("<!DOCTYPE html>" + doc.documentElement.outerHTML);
   document.close();
 })();
 </script>
