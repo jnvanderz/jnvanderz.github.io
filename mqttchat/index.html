@@ -1,1 +1,32 @@
-<html><script>window.location = "https://mqchat.neocities.org/";</script></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mqchat has moved</title>
+  <noscript><meta http-equiv="refresh" content="5; url=https://mqchat.neocities.org/"></noscript>
+</head>
+<body>
+  <h3>mqchat has moved</h3>
+  <a href="https://mqchat.neocities.org/">https://mqchat.neocities.org/</a>
+  <p>Redirecting in <span id="countdown">5</span> seconds…</p>
+
+  <script>
+    const TARGET = "https://mqchat.neocities.org/";
+    const DELAY = 5000;
+    const end = Date.now() + DELAY;
+    const el = document.getElementById("countdown");
+
+    const tick = () => {
+      const left = Math.max(0, end - Date.now());
+      el.textContent = Math.ceil(left / 1000);
+      if (left === 0) {
+        location.replace(TARGET);
+      } else {
+        setTimeout(tick, Math.min(250, left));
+      }
+    };
+    tick();
+  </script>
+</body>
+</html>
