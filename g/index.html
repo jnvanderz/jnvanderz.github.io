@@ -25,7 +25,6 @@ const RAW = "https://raw.githubusercontent.com/";
   const res = await get(url);
   if (!res.ok) return fail("Could not load " + url + " (HTTP " + res.status + ")");
   const doc = new DOMParser().parseFromString(await res.text(), "text/html");
-
   const els = [...doc.querySelectorAll('script[src], link[rel~="stylesheet"][href]')];
   await Promise.all(els.map(async (el) => {
     const isLink = el.tagName === "LINK";
